@@ -90,7 +90,8 @@ import inspect
 import os
 import shutil
 import torch
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from rsl_rl.runners import OnPolicyRunner  # TODO: Consider printing the experiment name in the terminal.
 
@@ -120,6 +121,30 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def get_log_timestamp() -> str:
+    """Return a timezone-aware timestamp for run directory names.
+
+    Isaac Lab containers commonly run in UTC even when the user works in UTC+8.  Default to
+    Asia/Shanghai/UTC+8 so run folders match the local wall-clock time.  Override with
+    ``UNITREE_LOG_TIMEZONE=UTC`` or another IANA timezone if needed.
+    """
+    timezone_name = os.environ.get("UNITREE_LOG_TIMEZONE", "Asia/Shanghai")
+    try:
+        now = datetime.now(ZoneInfo(timezone_name))
+    except ZoneInfoNotFoundError:
+        if timezone_name in {"Asia/Shanghai", "Asia/Chongqing", "Asia/Harbin", "Asia/Urumqi", "CST", "UTC+8"}:
+            fixed_tz = timezone(timedelta(hours=8), name="UTC+8")
+            now = datetime.now(fixed_tz)
+            timezone_name = "UTC+8"
+        else:
+            print(f"[WARN] Unknown UNITREE_LOG_TIMEZONE={timezone_name!r}; falling back to UTC.")
+            now = datetime.now(timezone.utc)
+            timezone_name = "UTC"
+
+    print(f"[INFO] Run timestamp timezone: {timezone_name}")
+    return now.strftime("%Y-%m-%d_%H-%M-%S")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -154,7 +179,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs: {time-stamp}_{run_name}
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir = get_log_timestamp()
     # This way, the Ray Tune workflow can extract experiment name.
     print(f"Exact experiment name requested from command line: {log_dir}")
     if agent_cfg.run_name:
