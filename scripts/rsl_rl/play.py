@@ -8,7 +8,6 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-from importlib.metadata import version
 
 from isaaclab.app import AppLauncher
 
@@ -19,6 +18,18 @@ import cli_args  # isort: skip
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
+parser.add_argument(
+    "--max_steps",
+    type=int,
+    default=None,
+    help="Stop playback after this many environment steps. By default playback runs until interrupted.",
+)
+parser.add_argument(
+    "--export",
+    action="store_true",
+    default=False,
+    help="Export the loaded policy to TorchScript and ONNX before playback.",
+)
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
@@ -63,7 +74,21 @@ except ModuleNotFoundError:
         from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
     except ModuleNotFoundError:
         get_published_pretrained_checkpoint = None
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg, export_policy_as_jit, export_policy_as_onnx
+from isaaclab_rl.rsl_rl import (
+    RslRlOnPolicyRunnerCfg,
+    RslRlVecEnvWrapper,
+    export_policy_as_jit,
+    export_policy_as_onnx,
+)
+
+try:
+    from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg
+except ImportError:
+
+    def handle_deprecated_rsl_rl_cfg(agent_cfg, _installed_version):
+        return agent_cfg
+
+
 from isaaclab_tasks.utils import get_checkpoint_path
 
 import unitree_rl_lab.tasks  # noqa: F401
@@ -139,108 +164,31 @@ def main():
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    policy_device = getattr(agent_cfg, "device", None)
-    if policy_device is None:
-        policy_device = getattr(env.unwrapped, "device", "cuda:0")
-    policy_nn = runner.get_inference_policy(device=policy_device)
+    if args_cli.export:
+        # RSL-RL 2.3 stores the policy under ``runner.alg.policy``. Older versions use
+        # ``runner.alg.actor_critic``. The Isaac Lab exporters expect this module, not
+        # the TensorDict-aware inference callable returned by ``get_inference_policy``.
+        try:
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            policy_nn = runner.alg.actor_critic
 
-    # extract the normalizer
-    if hasattr(policy_nn, "actor_obs_normalizer"):
-        normalizer = policy_nn.actor_obs_normalizer
-    elif hasattr(policy_nn, "student_obs_normalizer"):
-        normalizer = policy_nn.student_obs_normalizer
-    else:
-        normalizer = None
+        if hasattr(policy_nn, "actor_obs_normalizer"):
+            normalizer = policy_nn.actor_obs_normalizer
+        elif hasattr(policy_nn, "student_obs_normalizer"):
+            normalizer = policy_nn.student_obs_normalizer
+        else:
+            normalizer = None
 
-    # export policy to ONNX for MuJoCo sim-to-sim deployment
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    os.makedirs(export_model_dir, exist_ok=True)
-    export_onnx_path = os.path.join(export_model_dir, "policy.onnx")
-
-    def extract_policy_tensor(obs):
-        """Extract a plain torch.Tensor from Isaac Lab / TensorDict observations."""
-        if isinstance(obs, tuple):
-            obs = obs[0]
-
-        if torch.is_tensor(obs):
-            return obs
-
-        if hasattr(obs, "keys") and hasattr(obs, "__getitem__"):
-            keys = list(obs.keys())
-            print(f"[INFO] Observation type: {type(obs)}")
-            print(f"[INFO] Observation keys: {keys}")
-
-            if "policy" in keys:
-                return extract_policy_tensor(obs["policy"])
-
-            if "obs" in keys:
-                return extract_policy_tensor(obs["obs"])
-
-            if "observations" in keys:
-                return extract_policy_tensor(obs["observations"])
-
-            if len(keys) == 1:
-                return extract_policy_tensor(obs[keys[0]])
-
-        raise TypeError(f"Cannot extract plain torch.Tensor from observation type: {type(obs)}")
-
-    # Get one observation and convert it to a plain Tensor.
-    example_obs_raw = env.get_observations()
-    example_obs_tensor = extract_policy_tensor(example_obs_raw)
-
-    if not torch.is_tensor(example_obs_tensor):
-        raise TypeError(f"example_obs_tensor is not torch.Tensor, got {type(example_obs_tensor)}")
-
-    example_obs_tensor = example_obs_tensor[:1].to(policy_device)
-
-    print(f"[INFO] ONNX example_obs_tensor type: {type(example_obs_tensor)}")
-    print(f"[INFO] ONNX example_obs_tensor shape: {tuple(example_obs_tensor.shape)}")
-
-    class PolicyONNXWrapper(torch.nn.Module):
-        def __init__(self, policy_fn):
-            super().__init__()
-            self.policy_fn = policy_fn
-            self.obs_group = "policy"
-
-            if hasattr(policy_fn, "obs_groups"):
-                print(f"[INFO] policy_fn.obs_groups = {policy_fn.obs_groups}")
-                if len(policy_fn.obs_groups) == 1:
-                    self.obs_group = policy_fn.obs_groups[0]
-
-        def forward(self, obs_tensor):
-            obs_dict = {self.obs_group: obs_tensor}
-            actions = self.policy_fn(obs_dict)
-
-            if isinstance(actions, tuple):
-                actions = actions[0]
-
-            return actions
-
-    policy_exporter = PolicyONNXWrapper(policy_nn).to(policy_device).eval()
-
-    torch.onnx.export(
-        policy_exporter,
-        (example_obs_tensor,),
-        export_onnx_path,
-        input_names=["obs"],
-        output_names=["actions"],
-        opset_version=17,
-        dynamic_axes={
-            "obs": {0: "batch"},
-            "actions": {0: "batch"},
-        },
-    )
-
-    print(f"[INFO] Exported ONNX policy to: {export_onnx_path}")
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+        print(f"[INFO] Exported policy to: {export_model_dir}")
 
     dt = env.unwrapped.step_dt
 
     # reset environment
     obs = env.get_observations()
-    if version("rsl-rl-lib").startswith("2.3."):
-        obs, _ = env.get_observations()
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -251,11 +199,12 @@ def main():
             actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)
-        if args_cli.video:
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+        timestep += 1
+        # Exit after recording one video or after the requested finite playback duration.
+        if args_cli.video and timestep >= args_cli.video_length:
+            break
+        if args_cli.max_steps is not None and timestep >= args_cli.max_steps:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)

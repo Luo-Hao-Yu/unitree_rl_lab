@@ -164,9 +164,8 @@ class CommandsCfg:
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
 
-        # 第一阶段要让 policy 学会“摇杆不动=站立”
-        # 官方 0.02 对实物部署偏低，建议提高
-        rel_standing_envs=0.1,
+        # Locomotion bootstrap: remove zero commands so standing still is not a viable shortcut.
+        rel_standing_envs=0.0,
 
         # 不使用 heading command，直接训练 yaw rate
         rel_heading_envs=0.0,
@@ -174,19 +173,18 @@ class CommandsCfg:
 
         debug_vis=True,
 
-        # 第一阶段：小范围全向运动
+        # Locomotion bootstrap: train explicit forward motion before adding omnidirectional commands.
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.1, 0.1),
-            lin_vel_y=(-0.1, 0.1),
-            ang_vel_z=(-0.1, 0.1),
+            lin_vel_x=(0.2, 0.5),
+            lin_vel_y=(0.0, 0.0),
+            ang_vel_z=(0.0, 0.0),
         ),
 
-        # curriculum 或命令上限
-        # 第一阶段不要给得太激进
+        # Keep the bootstrap command distribution fixed until forward tracking is reliable.
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.5, 1.0),
-            lin_vel_y=(-0.3, 0.3),
-            ang_vel_z=(-0.2, 0.2),
+            lin_vel_x=(0.2, 0.5),
+            lin_vel_y=(0.0, 0.0),
+            ang_vel_z=(0.0, 0.0),
         ),
     )
 
@@ -256,8 +254,8 @@ class RewardsCfg:
     # -- task
     track_lin_vel_xy = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
-        weight=2.0,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": 0.20},
     )
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp, 
@@ -279,7 +277,7 @@ class RewardsCfg:
 
     joint_deviation_arms = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.1,
+        weight=-0.05,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot",
@@ -341,6 +339,145 @@ class RewardsCfg:
             "tanh_mult": 2.0,
             "target_height": 0.1,
             "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"),
+        },
+    )
+
+    # -- Stage 1: temporarily inactive during forward-locomotion bootstrap
+    contralateral_arm_leg_phase = RewTerm(
+        func=mdp.contralateral_arm_leg_phase_reward,
+        weight=0.0,
+        params={
+            "period": 0.8,
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "k_A": 0.35,
+            "A_min": 0.03,
+            "A_max": 0.25,
+            "sigma_contra": 0.25,
+            "left_sign": 1.0,
+            "right_sign": 1.0,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
+            ),
+        },
+    )
+    bilateral_arm_antiphase = RewTerm(
+        func=mdp.bilateral_arm_antiphase_reward,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "sigma_anti": 0.20,
+            "left_sign": 1.0,
+            "right_sign": 1.0,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
+            ),
+        },
+    )
+    stop_arm_settle = RewTerm(
+        func=mdp.stop_arm_settle_reward,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "lambda_qdot": 0.05,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    ".*_shoulder_.*_joint",
+                    ".*_elbow_joint",
+                    ".*_wrist_roll_joint",
+                ],
+            ),
+        },
+    )
+
+    # -- Stage 2: max-plus contact timing (inactive; suggested future weight: 0.3 each)
+    maxplus_stop_leg_contact = RewTerm(
+        func=mdp.maxplus_stop_leg_contact_reward,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+        },
+    )
+    maxplus_contact_schedule = RewTerm(
+        func=mdp.maxplus_contact_schedule_reward,
+        weight=0.0,
+        params={
+            "period": 0.8,
+            "double_support_ratio": 0.15,
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    # -- Stage 3: arm amplitude and natural posture refinement (inactive)
+    arm_swing_amplitude = RewTerm(
+        func=mdp.arm_swing_amplitude_reward,
+        weight=0.0,
+        params={
+            "period": 0.8,
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "k_A": 0.35,
+            "A_min": 0.03,
+            "A_max": 0.25,
+            "sigma_amp": 0.20,
+            "left_sign": 1.0,
+            "right_sign": 1.0,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
+            ),
+        },
+    )
+    arm_natural_posture = RewTerm(
+        func=mdp.arm_natural_posture_penalty,
+        weight=0.0,
+        params={
+            "position_weight": 1.0,
+            "velocity_weight": 0.05,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    ".*_shoulder_roll_joint",
+                    ".*_shoulder_yaw_joint",
+                    ".*_elbow_joint",
+                    ".*_wrist_roll_joint",
+                ],
+            ),
+        },
+    )
+
+    # -- Stage 4: coupled arm-trunk stability (inactive; suggested future weight: 0.1)
+    arm_trunk_stabilization = RewTerm(
+        func=mdp.arm_trunk_stabilization_reward,
+        weight=0.0,
+        params={
+            "period": 0.8,
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "k_A": 0.35,
+            "A_min": 0.03,
+            "A_max": 0.25,
+            "sigma_contra": 0.25,
+            "sigma_omega": 0.50,
+            "left_sign": 1.0,
+            "right_sign": 1.0,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
+            ),
         },
     )
 
@@ -427,12 +564,12 @@ class RobotPlayEnvCfg(RobotEnvCfg):
         self.commands.base_velocity.heading_command = False
 
         self.commands.base_velocity.ranges = mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.5, 0.5),
+            lin_vel_x=(0.3, 0.3),
             lin_vel_y=(0.0, 0.0),
             ang_vel_z=(0.0, 0.0),
         )
         self.commands.base_velocity.limit_ranges = mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.5, 0.5),
+            lin_vel_x=(0.3, 0.3),
             lin_vel_y=(0.0, 0.0),
             ang_vel_z=(0.0, 0.0),
         )

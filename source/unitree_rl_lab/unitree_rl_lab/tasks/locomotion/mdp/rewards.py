@@ -14,6 +14,92 @@ from isaaclab.sensors import ContactSensor
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+
+def _command_masks(
+    env: ManagerBasedRLEnv, command_name: str, cmd_threshold: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the L1 command norm together with float walking and stopping masks."""
+    command = env.command_manager.get_command(command_name)
+    command_norm = torch.sum(torch.abs(command[:, :3]), dim=-1)
+    walk_mask = (command_norm > cmd_threshold).to(command.dtype)
+    stop_mask = 1.0 - walk_mask
+    return command_norm, walk_mask, stop_mask
+
+
+def _gait_phase(env: ManagerBasedRLEnv, period: float) -> torch.Tensor:
+    """Return the episode-time gait phase in ``[0, 1)`` for every environment."""
+    return torch.remainder(env.episode_length_buf * env.step_dt, period) / period
+
+
+def _foot_contacts(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Return left/right binary foot contacts ordered by ``sensor_cfg.body_ids``."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contacts = (contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0).to(
+        contact_sensor.data.current_contact_time.dtype
+    )
+    if contacts.shape[1] != 2:
+        raise ValueError(f"Expected exactly two foot bodies, got {contacts.shape[1]}.")
+    return contacts
+
+
+def _shoulder_pitch_relative(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    left_sign: float,
+    right_sign: float,
+) -> tuple[Articulation, torch.Tensor, torch.Tensor]:
+    """Return normalized left/right shoulder-pitch offsets from the default pose."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    shoulder_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    shoulder_default = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    if shoulder_pos.shape[1] != 2:
+        raise ValueError(f"Expected exactly two shoulder-pitch joints, got {shoulder_pos.shape[1]}.")
+    left_arm = left_sign * (shoulder_pos[:, 0] - shoulder_default[:, 0])
+    right_arm = right_sign * (shoulder_pos[:, 1] - shoulder_default[:, 1])
+    return asset, left_arm, right_arm
+
+
+def _arm_reference(
+    env: ManagerBasedRLEnv,
+    period: float,
+    command_name: str,
+    cmd_threshold: float,
+    k_A: float,
+    A_min: float,
+    A_max: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return walking mask, amplitude, and contralateral left/right arm references."""
+    command = env.command_manager.get_command(command_name)
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+    phase = _gait_phase(env, period)
+    amplitude = torch.clamp(k_A * torch.abs(command[:, 0]), min=A_min, max=A_max)
+    right_reference = amplitude * torch.sin(2.0 * torch.pi * phase)
+    left_reference = -right_reference
+    return walk_mask, amplitude, left_reference, right_reference
+
+
+def _contralateral_error(
+    env: ManagerBasedRLEnv,
+    period: float,
+    command_name: str,
+    cmd_threshold: float,
+    k_A: float,
+    A_min: float,
+    A_max: float,
+    asset_cfg: SceneEntityCfg,
+    left_sign: float,
+    right_sign: float,
+) -> tuple[Articulation, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the articulation, walking mask, arm variables, and contralateral squared error."""
+    asset, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign)
+    walk_mask, _, left_reference, right_reference = _arm_reference(
+        env, period, command_name, cmd_threshold, k_A, A_min, A_max
+    )
+    error = torch.square(left_arm - left_reference) + torch.square(right_arm - right_reference)
+    arms = torch.stack((left_arm, right_arm), dim=-1)
+    return asset, walk_mask, arms, error
+
+
 """
 Joint penalties.
 """
@@ -198,6 +284,214 @@ def feet_gait(
         cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
         reward *= cmd_norm > 0.1
     return reward
+
+
+"""
+Staged gait timing and arm-leg coordination rewards.
+"""
+
+
+def maxplus_contact_schedule_reward(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    period: float = 0.8,
+    double_support_ratio: float = 0.15,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Penalize walking-foot contacts that disagree with a periodic max-plus-inspired schedule.
+
+    The reference alternates left and right single support, separated by double-support windows of
+    ``double_support_ratio``. The returned value is ``-m_walk * (|c_L-c_L_ref| + |c_R-c_R_ref|)``.
+    ``sensor_cfg`` must resolve exactly the left and right foot bodies in that order.
+
+    TODO: minimum swing-time and minimum double-support rewards require per-environment event memory and are
+    intentionally deferred.
+    """
+    phase = _gait_phase(env, period)
+    contacts = _foot_contacts(env, sensor_cfg)
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+
+    left_reference = torch.logical_or(phase < 0.5, phase >= 1.0 - double_support_ratio)
+    right_reference = phase >= 0.5 - double_support_ratio
+    references = torch.stack((left_reference, right_reference), dim=-1).to(contacts.dtype)
+    contact_error = torch.sum(torch.abs(contacts - references), dim=-1)
+    return -walk_mask * contact_error
+
+
+def maxplus_stop_leg_contact_reward(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Penalize missing left or right foot contact while commanded to stop.
+
+    The returned value is ``-m_stop * (|1-c_L| + |1-c_R|)``. ``sensor_cfg`` must resolve exactly the
+    left and right foot bodies in that order.
+    """
+    contacts = _foot_contacts(env, sensor_cfg)
+    _, _, stop_mask = _command_masks(env, command_name, cmd_threshold)
+    contact_error = torch.sum(torch.abs(1.0 - contacts), dim=-1)
+    return -stop_mask * contact_error
+
+
+def contralateral_arm_leg_phase_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    period: float = 0.8,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    k_A: float = 0.35,
+    A_min: float = 0.03,
+    A_max: float = 0.25,
+    sigma_contra: float = 0.25,
+    left_sign: float = 1.0,
+    right_sign: float = 1.0,
+) -> torch.Tensor:
+    """Reward shoulder-pitch tracking of a contralateral arm-leg phase reference.
+
+    The desired amplitude is ``clip(k_A*|v_x_cmd|, A_min, A_max)``. Left and right shoulder offsets track
+    opposite sinusoidal references, producing right-arm/left-leg and left-arm/right-leg coordination.
+    ``asset_cfg`` must resolve left then right shoulder-pitch joints.
+    """
+    _, walk_mask, _, error = _contralateral_error(
+        env,
+        period,
+        command_name,
+        cmd_threshold,
+        k_A,
+        A_min,
+        A_max,
+        asset_cfg,
+        left_sign,
+        right_sign,
+    )
+    return walk_mask * torch.exp(-error / sigma_contra**2)
+
+
+def arm_swing_amplitude_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    period: float = 0.8,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    k_A: float = 0.35,
+    A_min: float = 0.03,
+    A_max: float = 0.25,
+    sigma_amp: float = 0.20,
+    left_sign: float = 1.0,
+    right_sign: float = 1.0,
+) -> torch.Tensor:
+    """Reward both shoulder-pitch amplitudes for matching the speed-scaled reference amplitude.
+
+    The returned reward is ``m_walk * exp(-((|q_L|-A_ref)^2 + (|q_R|-A_ref)^2) / sigma_amp^2)``.
+    ``asset_cfg`` must resolve left then right shoulder-pitch joints. ``period`` is accepted for a consistent
+    staged-reward interface; amplitude itself depends only on commanded forward speed.
+    """
+    del period
+    _, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign)
+    command = env.command_manager.get_command(command_name)
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+    amplitude = torch.clamp(k_A * torch.abs(command[:, 0]), min=A_min, max=A_max)
+    error = torch.square(torch.abs(left_arm) - amplitude) + torch.square(torch.abs(right_arm) - amplitude)
+    return walk_mask * torch.exp(-error / sigma_amp**2)
+
+
+def bilateral_arm_antiphase_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    sigma_anti: float = 0.20,
+    left_sign: float = 1.0,
+    right_sign: float = 1.0,
+) -> torch.Tensor:
+    """Reward left and right shoulder-pitch offsets for remaining in anti-phase while walking.
+
+    The returned reward is ``m_walk * exp(-(q_L_tilde + q_R_tilde)^2 / sigma_anti^2)``.
+    ``asset_cfg`` must resolve left then right shoulder-pitch joints.
+    """
+    _, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign)
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+    error = torch.square(left_arm + right_arm)
+    return walk_mask * torch.exp(-error / sigma_anti**2)
+
+
+def arm_natural_posture_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    position_weight: float = 1.0,
+    velocity_weight: float = 0.05,
+) -> torch.Tensor:
+    """Penalize unnatural non-sagittal arm posture and excessive arm-joint velocity.
+
+    ``asset_cfg`` should exclude shoulder pitch and include shoulder roll/yaw, elbows, and wrists. The returned
+    penalty is ``-(position_weight*sum((q-q_default)^2) + velocity_weight*sum(qdot^2))``.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    position_error = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    joint_velocity = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return -position_weight * torch.sum(torch.square(position_error), dim=-1) - velocity_weight * torch.sum(
+        torch.square(joint_velocity), dim=-1
+    )
+
+
+def arm_trunk_stabilization_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    period: float = 0.8,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    k_A: float = 0.35,
+    A_min: float = 0.03,
+    A_max: float = 0.25,
+    sigma_contra: float = 0.25,
+    sigma_omega: float = 0.50,
+    left_sign: float = 1.0,
+    right_sign: float = 1.0,
+) -> torch.Tensor:
+    """Reward contralateral arm coordination only when trunk roll/pitch angular velocity is small.
+
+    The returned reward is ``m_walk * exp(-||omega_xy||^2/sigma_omega^2 - E_contra/sigma_contra^2)``.
+    ``asset_cfg`` must resolve left then right shoulder-pitch joints.
+    """
+    asset, walk_mask, _, error = _contralateral_error(
+        env,
+        period,
+        command_name,
+        cmd_threshold,
+        k_A,
+        A_min,
+        A_max,
+        asset_cfg,
+        left_sign,
+        right_sign,
+    )
+    trunk_error = torch.sum(torch.square(asset.data.root_ang_vel_b[:, :2]), dim=-1)
+    return walk_mask * torch.exp(-trunk_error / sigma_omega**2 - error / sigma_contra**2)
+
+
+def stop_arm_settle_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    lambda_qdot: float = 0.05,
+) -> torch.Tensor:
+    """Penalize arm displacement and motion while the commanded base velocity is near zero.
+
+    The returned value is ``-m_stop * (sum((q-q_default)^2) + lambda_qdot*sum(qdot^2))``.
+    ``asset_cfg`` should include all shoulder, elbow, and wrist joints.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    position_error = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    joint_velocity = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    _, _, stop_mask = _command_masks(env, command_name, cmd_threshold)
+    error = torch.sum(torch.square(position_error), dim=-1) + lambda_qdot * torch.sum(
+        torch.square(joint_velocity), dim=-1
+    )
+    return -stop_mask * error
 
 
 """
