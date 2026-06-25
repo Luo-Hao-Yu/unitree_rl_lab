@@ -47,15 +47,20 @@ def _shoulder_pitch_relative(
     asset_cfg: SceneEntityCfg,
     left_sign: float,
     right_sign: float,
+    center_offset: float = 0.0,
 ) -> tuple[Articulation, torch.Tensor, torch.Tensor]:
-    """Return normalized left/right shoulder-pitch offsets from the default pose."""
+    """Return normalized left/right shoulder-pitch offsets from a configurable center pose.
+
+    ``center_offset`` shifts both physical shoulder-pitch centers relative to the articulation default pose.
+    This is useful when the robot's default arm pose is visually too far forward for natural walking.
+    """
     asset: Articulation = env.scene[asset_cfg.name]
     shoulder_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
-    shoulder_default = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    shoulder_center = asset.data.default_joint_pos[:, asset_cfg.joint_ids] + center_offset
     if shoulder_pos.shape[1] != 2:
         raise ValueError(f"Expected exactly two shoulder-pitch joints, got {shoulder_pos.shape[1]}.")
-    left_arm = left_sign * (shoulder_pos[:, 0] - shoulder_default[:, 0])
-    right_arm = right_sign * (shoulder_pos[:, 1] - shoulder_default[:, 1])
+    left_arm = left_sign * (shoulder_pos[:, 0] - shoulder_center[:, 0])
+    right_arm = right_sign * (shoulder_pos[:, 1] - shoulder_center[:, 1])
     return asset, left_arm, right_arm
 
 
@@ -89,9 +94,10 @@ def _contralateral_error(
     asset_cfg: SceneEntityCfg,
     left_sign: float,
     right_sign: float,
+    center_offset: float = 0.0,
 ) -> tuple[Articulation, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return the articulation, walking mask, arm variables, and contralateral squared error."""
-    asset, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign)
+    asset, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign, center_offset)
     walk_mask, _, left_reference, right_reference = _arm_reference(
         env, period, command_name, cmd_threshold, k_A, A_min, A_max
     )
@@ -348,6 +354,7 @@ def contralateral_arm_leg_phase_reward(
     sigma_contra: float = 0.25,
     left_sign: float = 1.0,
     right_sign: float = 1.0,
+    center_offset: float = 0.0,
 ) -> torch.Tensor:
     """Reward shoulder-pitch tracking of a contralateral arm-leg phase reference.
 
@@ -366,6 +373,7 @@ def contralateral_arm_leg_phase_reward(
         asset_cfg,
         left_sign,
         right_sign,
+        center_offset,
     )
     return walk_mask * torch.exp(-error / sigma_contra**2)
 
@@ -382,6 +390,7 @@ def arm_swing_amplitude_reward(
     sigma_amp: float = 0.20,
     left_sign: float = 1.0,
     right_sign: float = 1.0,
+    center_offset: float = 0.0,
 ) -> torch.Tensor:
     """Reward both shoulder-pitch amplitudes for matching the speed-scaled reference amplitude.
 
@@ -390,12 +399,73 @@ def arm_swing_amplitude_reward(
     staged-reward interface; amplitude itself depends only on commanded forward speed.
     """
     del period
-    _, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign)
+    _, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign, center_offset)
     command = env.command_manager.get_command(command_name)
     _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
     amplitude = torch.clamp(k_A * torch.abs(command[:, 0]), min=A_min, max=A_max)
     error = torch.square(torch.abs(left_arm) - amplitude) + torch.square(torch.abs(right_arm) - amplitude)
     return walk_mask * torch.exp(-error / sigma_amp**2)
+
+
+def arm_swing_velocity_tracking_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    period: float = 0.8,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    k_A: float = 0.35,
+    A_min: float = 0.03,
+    A_max: float = 0.25,
+    sigma_vel: float = 1.50,
+    left_sign: float = 1.0,
+    right_sign: float = 1.0,
+    center_offset: float = 0.0,
+) -> torch.Tensor:
+    """Reward dynamic shoulder-pitch swing velocity around the default pose.
+
+    Static anti-phase arm offsets can satisfy amplitude and bilateral anti-phase rewards without producing
+    human-like shoulder swing. This term tracks the time derivative of the same contralateral sinusoidal
+    reference, encouraging the shoulder pitch joints to move forward/backward through the default pose instead
+    of holding one arm permanently forward and the other permanently backward.
+    """
+    asset, _, _ = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign, center_offset)
+    walk_mask, amplitude, _, _ = _arm_reference(env, period, command_name, cmd_threshold, k_A, A_min, A_max)
+    phase = _gait_phase(env, period)
+    omega = 2.0 * torch.pi / period
+
+    shoulder_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    if shoulder_vel.shape[1] != 2:
+        raise ValueError(f"Expected exactly two shoulder-pitch joints, got {shoulder_vel.shape[1]}.")
+
+    right_velocity_reference = amplitude * omega * torch.cos(2.0 * torch.pi * phase)
+    left_velocity_reference = -right_velocity_reference
+    left_velocity = left_sign * shoulder_vel[:, 0]
+    right_velocity = right_sign * shoulder_vel[:, 1]
+
+    error = torch.square(left_velocity - left_velocity_reference) + torch.square(
+        right_velocity - right_velocity_reference
+    )
+    return walk_mask * torch.exp(-error / sigma_vel**2)
+
+
+def shoulder_pitch_bias_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    left_sign: float = 1.0,
+    right_sign: float = 1.0,
+    center_offset: float = 0.0,
+) -> torch.Tensor:
+    """Penalize common-mode static shoulder-pitch bias while walking.
+
+    This discourages the local optimum where both arms stay globally forward or backward while making only
+    small oscillations. In the signed shoulder-pitch coordinates used by the arm rewards, an anti-phase human
+    arm swing has near-zero common mode: ``left_arm + right_arm ~= 0``.
+    """
+    _, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign, center_offset)
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+    return -walk_mask * torch.square(0.5 * (left_arm + right_arm))
 
 
 def bilateral_arm_antiphase_reward(
@@ -406,13 +476,14 @@ def bilateral_arm_antiphase_reward(
     sigma_anti: float = 0.20,
     left_sign: float = 1.0,
     right_sign: float = 1.0,
+    center_offset: float = 0.0,
 ) -> torch.Tensor:
     """Reward left and right shoulder-pitch offsets for remaining in anti-phase while walking.
 
     The returned reward is ``m_walk * exp(-(q_L_tilde + q_R_tilde)^2 / sigma_anti^2)``.
     ``asset_cfg`` must resolve left then right shoulder-pitch joints.
     """
-    _, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign)
+    _, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign, center_offset)
     _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
     error = torch.square(left_arm + right_arm)
     return walk_mask * torch.exp(-error / sigma_anti**2)
@@ -450,6 +521,7 @@ def arm_trunk_stabilization_reward(
     sigma_omega: float = 0.50,
     left_sign: float = 1.0,
     right_sign: float = 1.0,
+    center_offset: float = 0.0,
 ) -> torch.Tensor:
     """Reward contralateral arm coordination only when trunk roll/pitch angular velocity is small.
 
@@ -467,6 +539,7 @@ def arm_trunk_stabilization_reward(
         asset_cfg,
         left_sign,
         right_sign,
+        center_offset,
     )
     trunk_error = torch.sum(torch.square(asset.data.root_ang_vel_b[:, :2]), dim=-1)
     return walk_mask * torch.exp(-trunk_error / sigma_omega**2 - error / sigma_contra**2)
