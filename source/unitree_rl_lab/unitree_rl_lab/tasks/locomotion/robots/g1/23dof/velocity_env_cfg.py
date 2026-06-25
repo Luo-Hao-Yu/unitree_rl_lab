@@ -465,14 +465,14 @@ class RewardsCfg:
     # -- Stage 3: arm amplitude and natural posture refinement
     arm_swing_amplitude = RewTerm(
         func=mdp.arm_swing_amplitude_reward,
-        weight=0.08,
+        weight=0.12,
         params={
             "period": 0.8,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
             "k_A": 0.90,
             "A_min": 0.18,
-            "A_max": 0.60,
+            "A_max": 0.70,
             "sigma_amp": 0.20,
             "left_sign": -1.0,
             "right_sign": 1.0,
