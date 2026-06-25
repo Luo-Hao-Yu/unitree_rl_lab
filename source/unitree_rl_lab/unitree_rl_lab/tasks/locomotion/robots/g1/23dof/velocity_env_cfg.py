@@ -250,32 +250,72 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP."""
+    """Reward terms for the MDP.
 
-    # -- task
+    The rewards below are ordered by the actual staged training path used for G1-23DoF:
+    Stage 0 locomotion bootstrap -> Stage 1 leg gait -> Stage 2 arm-leg phase ->
+    Stage 3 shoulder swing refinement -> future/inactive refinements.
+
+    以下 reward 按实际训练阶段排序：
+    Stage 0 前进行走基础 -> Stage 1 腿部步态 -> Stage 2 手臂-腿部相位 ->
+    Stage 3 肩关节摆臂细化 -> 后续未启用增强项。
+    """
+
+    # --------------------------------------------------------------------------
+    # Stage 0: Forward-locomotion bootstrap and safety foundation
+    # Stage 0：前进行走基础与安全项
+    # --------------------------------------------------------------------------
+
+    # Track commanded planar velocity in the yaw frame.
+    # 跟踪机体 yaw 坐标系下的平面速度命令，是“能向前走”的主任务奖励。
     track_lin_vel_xy = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
         weight=3.0,
         params={"command_name": "base_velocity", "std": 0.20},
     )
-    track_ang_vel_z = RewTerm(
-        func=mdp.track_ang_vel_z_exp, 
-        weight=0.2, 
-        params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
-    )
-    
 
+    # Track commanded yaw angular velocity.
+    # 跟踪 yaw 角速度命令；当前训练中 yaw 命令为 0，用于抑制无意义转向。
+    track_ang_vel_z = RewTerm(
+        func=mdp.track_ang_vel_z_exp,
+        weight=0.2,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+    )
+
+    # Reward survival at each step.
+    # 存活奖励，鼓励 episode 不提前终止。
     alive = RewTerm(func=mdp.is_alive, weight=0.05)
 
-    # -- base
+    # Penalize vertical base velocity.
+    # 惩罚机体竖直方向速度，减少跳动和上下抖动。
     base_linear_velocity = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
+
+    # Penalize base roll/pitch angular velocity.
+    # 惩罚机体 roll/pitch 角速度，提升躯干稳定性。
     base_angular_velocity = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+
+    # Penalize excessive joint velocity.
+    # 惩罚过大的关节速度，避免动作过于急促。
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-0.001)
+
+    # Penalize excessive joint acceleration.
+    # 惩罚过大的关节加速度，提升动作平滑性。
     joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
+
+    # Penalize rapid action changes.
+    # 惩罚连续动作变化过快，减少控制抖动。
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.02)
+
+    # Penalize approaching joint position limits.
+    # 惩罚接近关节限位，避免不安全姿态。
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-5.0)
+
+    # Penalize mechanical energy use.
+    # 惩罚能耗，避免高扭矩高速运动。
     energy = RewTerm(func=mdp.energy, weight=-2e-5)
 
+    # Keep non-sagittal arm joints, elbows, and wrists near their default pose.
+    # 约束肩 roll/yaw、肘、腕靠近默认姿态；不约束 shoulder pitch，避免压制主动摆臂。
     joint_deviation_arms = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.02,
@@ -291,6 +331,9 @@ class RewardsCfg:
             )
         },
     )
+
+    # Keep waist joints near their default pose.
+    # 约束腰部关节靠近默认姿态，减少躯干扭曲。
     joint_deviation_waists = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-1,
@@ -303,17 +346,41 @@ class RewardsCfg:
             )
         },
     )
+
+    # Keep leg roll/yaw joints near nominal posture.
+    # 约束腿部 roll/yaw 关节，避免外八、扭腿等异常姿态。
     joint_deviation_legs = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"])},
     )
 
-    # -- robot
+    # Penalize non-flat base orientation.
+    # 惩罚机体倾斜，保持身体基本直立。
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
+
+    # Penalize deviation from target base height.
+    # 惩罚机体高度偏离目标高度，避免蹲得太低或跳起。
     base_height = RewTerm(func=mdp.base_height_l2, weight=-10, params={"target_height": 0.78})
 
-    # -- feet
+    # Penalize undesired non-foot contacts.
+    # 惩罚非脚部身体接触地面或发生碰撞，提升安全性。
+    undesired_contacts = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-1,
+        params={
+            "threshold": 1,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["(?!.*ankle.*).*"]),
+        },
+    )
+
+    # --------------------------------------------------------------------------
+    # Stage 1: Leg gait shaping and larger walking motion
+    # Stage 1：腿部步态塑形与迈腿幅度增强
+    # --------------------------------------------------------------------------
+
+    # Encourage alternating left/right foot contact according to a fixed gait phase.
+    # 鼓励左右脚按固定相位交替接触地面，形成基础步态节奏。
     gait = RewTerm(
         func=mdp.feet_gait,
         weight=0.5,
@@ -325,6 +392,9 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
         },
     )
+
+    # Penalize foot sliding while in contact.
+    # 惩罚脚底接触地面时的滑动，减少拖脚。
     feet_slide = RewTerm(
         func=mdp.feet_slide,
         weight=-0.2,
@@ -333,6 +403,9 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
         },
     )
+
+    # Reward sufficient foot clearance during swing.
+    # 奖励摆动腿有足够离地高度，增强迈腿幅度并减少擦地。
     feet_clearance = RewTerm(
         func=mdp.foot_clearance_reward,
         weight=1.2,
@@ -344,7 +417,15 @@ class RewardsCfg:
         },
     )
 
-    # -- Stage 1: arm-leg coordination and stop-arm settling
+    # --------------------------------------------------------------------------
+    # Stage 2: Arm-leg phase coordination around a natural shoulder center
+    # Stage 2：围绕自然肩部中心的手臂-腿部相位协调
+    # --------------------------------------------------------------------------
+
+    # Track a contralateral sinusoidal shoulder-pitch reference.
+    # 跟踪左右肩 pitch 反相正弦参考，使右臂-左腿、左臂-右腿协调摆动。
+    # center_offset shifts the shoulder-pitch center backward from the default pose.
+    # center_offset 将肩 pitch 摆动中心从默认偏前位置后移到更自然的位置。
     contralateral_arm_leg_phase = RewTerm(
         func=mdp.contralateral_arm_leg_phase_reward,
         weight=0.60,
@@ -364,6 +445,9 @@ class RewardsCfg:
             ),
         },
     )
+
+    # Weakly encourage left/right shoulder-pitch anti-phase relation.
+    # 弱约束左右肩 pitch 保持反相；权重较小，避免静态一前一后的坏解。
     bilateral_arm_antiphase = RewTerm(
         func=mdp.bilateral_arm_antiphase_reward,
         weight=0.03,
@@ -379,17 +463,49 @@ class RewardsCfg:
             ),
         },
     )
-    stop_arm_settle = RewTerm(
-        func=mdp.stop_arm_settle_reward,
-        weight=0.05,
+
+
+
+    # --------------------------------------------------------------------------
+    # Stage 3: Shoulder-swing amplitude and dynamic swing refinement
+    # Stage 3：肩部摆臂幅度与动态摆动细化
+    # --------------------------------------------------------------------------
+
+
+
+    # Reward larger shoulder-pitch swing amplitude around the shifted center.
+    # 奖励围绕后移中心的大幅肩 pitch 摆臂，是当前增强“人类式摆臂幅度”的主项。
+    arm_swing_amplitude = RewTerm(
+        func=mdp.arm_swing_amplitude_reward,
+        weight=0.12,
         params={
+            "period": 0.8,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
-            "lambda_qdot": 0.05,
+            "k_A": 0.90,
+            "A_min": 0.18,
+            "A_max": 0.70,
+            "sigma_amp": 0.20,
+            "left_sign": -1.0,
+            "right_sign": 1.0,
+            "center_offset": -0.30,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
+            ),
+        },
+    )
+
+    # Keep elbows and wrists natural while allowing shoulder pitch to swing freely.
+    # 约束肘和腕保持自然，避免用肘部小抖动代替肩部摆臂；不约束 shoulder pitch。
+    arm_natural_posture = RewTerm(
+        func=mdp.arm_natural_posture_penalty,
+        weight=0.03,
+        params={
+            "position_weight": 1.0,
+            "velocity_weight": 0.05,
             "asset_cfg": SceneEntityCfg(
                 "robot",
                 joint_names=[
-                    ".*_shoulder_.*_joint",
                     ".*_elbow_joint",
                     ".*_wrist_roll_joint",
                 ],
@@ -397,36 +513,25 @@ class RewardsCfg:
         },
     )
 
-    # -- Stage 2: max-plus contact timing (inactive; suggested future weight: 0.3 each)
-    maxplus_stop_leg_contact = RewTerm(
-        func=mdp.maxplus_stop_leg_contact_reward,
-        weight=0.0,
+    # Penalize common-mode shoulder-pitch bias while walking.
+    # 惩罚两臂共同前偏/后偏，避免“两只手都在身体前方”的姿态。
+    shoulder_pitch_bias = RewTerm(
+        func=mdp.shoulder_pitch_bias_penalty,
+        weight=0.3,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces",
-                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
-                preserve_order=True,
-            ),
-        },
-    )
-    maxplus_contact_schedule = RewTerm(
-        func=mdp.maxplus_contact_schedule_reward,
-        weight=0.0,
-        params={
-            "period": 0.8,
-            "double_support_ratio": 0.15,
-            "command_name": "base_velocity",
-            "cmd_threshold": 0.05,
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces",
-                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
-                preserve_order=True,
+            "left_sign": -1.0,
+            "right_sign": 1.0,
+            "center_offset": -0.30,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
             ),
         },
     )
 
+    # Reward shoulder-pitch velocity tracking of the dynamic sinusoidal reference.
+    # 奖励肩 pitch 速度跟随正弦参考，促使手臂真正前后摆动，而不是静态偏置。
     arm_swing_velocity = RewTerm(
         func=mdp.arm_swing_velocity_tracking_reward,
         weight=0.35,
@@ -447,58 +552,68 @@ class RewardsCfg:
         },
     )
 
-    shoulder_pitch_bias = RewTerm(
-        func=mdp.shoulder_pitch_bias_penalty,
-        weight=0.3,
+    # Penalize arm motion and displacement while commanded to stop.
+    # 停止命令下惩罚手臂偏离和速度，使站立时手臂逐渐安静。
+    stop_arm_settle = RewTerm(
+        func=mdp.stop_arm_settle_reward,
+        weight=0.05,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
-            "left_sign": -1.0,
-            "right_sign": 1.0,
-            "center_offset": -0.30,
-            "asset_cfg": SceneEntityCfg(
-                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
-            ),
-        },
-    )
-
-    # -- Stage 3: arm amplitude and natural posture refinement
-    arm_swing_amplitude = RewTerm(
-        func=mdp.arm_swing_amplitude_reward,
-        weight=0.12,
-        params={
-            "period": 0.8,
-            "command_name": "base_velocity",
-            "cmd_threshold": 0.05,
-            "k_A": 0.90,
-            "A_min": 0.18,
-            "A_max": 0.70,
-            "sigma_amp": 0.20,
-            "left_sign": -1.0,
-            "right_sign": 1.0,
-            "center_offset": -0.30,
-            "asset_cfg": SceneEntityCfg(
-                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
-            ),
-        },
-    )
-    arm_natural_posture = RewTerm(
-        func=mdp.arm_natural_posture_penalty,
-        weight=0.03,
-        params={
-            "position_weight": 1.0,
-            "velocity_weight": 0.05,
+            "lambda_qdot": 0.05,
             "asset_cfg": SceneEntityCfg(
                 "robot",
                 joint_names=[
+                    ".*_shoulder_.*_joint",
                     ".*_elbow_joint",
                     ".*_wrist_roll_joint",
                 ],
             ),
         },
     )
+    # --------------------------------------------------------------------------
+    # Stage 4: Stop behavior and inactive future refinements
+    # Stage 4：停止行为与后续未启用增强项
+    # --------------------------------------------------------------------------
 
-    # -- Stage 4: coupled arm-trunk stability (inactive; suggested future weight: 0.1)
+
+
+    # Inactive: reward both feet staying in contact while stopped.
+    # 未启用：停止命令下鼓励双脚稳定接触地面。
+    maxplus_stop_leg_contact = RewTerm(
+        func=mdp.maxplus_stop_leg_contact_reward,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    # Inactive: max-plus-inspired periodic contact schedule.
+    # 未启用：基于 max-plus 思路的周期足端接触时序约束。
+    maxplus_contact_schedule = RewTerm(
+        func=mdp.maxplus_contact_schedule_reward,
+        weight=0.0,
+        params={
+            "period": 0.8,
+            "double_support_ratio": 0.15,
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    # Inactive: couple good arm swing with low trunk roll/pitch angular velocity.
+    # 未启用：在躯干 roll/pitch 角速度较小时奖励摆臂，后续用于手臂-躯干稳定耦合。
     arm_trunk_stabilization = RewTerm(
         func=mdp.arm_trunk_stabilization_reward,
         weight=0.0,
@@ -519,17 +634,6 @@ class RewardsCfg:
             ),
         },
     )
-
-    # -- other
-    undesired_contacts = RewTerm(
-        func=mdp.undesired_contacts,
-        weight=-1,
-        params={
-            "threshold": 1,
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["(?!.*ankle.*).*"]),
-        },
-    )
-
 
 @configclass
 class TerminationsCfg:
