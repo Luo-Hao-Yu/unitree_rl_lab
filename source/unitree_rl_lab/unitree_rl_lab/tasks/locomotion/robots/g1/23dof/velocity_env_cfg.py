@@ -174,16 +174,18 @@ class CommandsCfg:
 
         debug_vis=True,
 
-        # Amplitude refinement: slightly faster forward commands encourage longer steps.
+        # Stage-4 stride refinement: faster forward commands encourage longer steps.
+        # Stage 4 步幅细化：稍微提高前进速度命令，减少原地小碎步倾向。
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.3, 0.65),
+            lin_vel_x=(0.4, 0.8),
             lin_vel_y=(0.0, 0.0),
             ang_vel_z=(0.0, 0.0),
         ),
 
-        # Keep the forward command distribution fixed during amplitude refinement.
+        # Keep the forward command distribution fixed during stride refinement.
+        # 固定当前前进速度范围，让这轮训练集中学习更大的步幅。
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.3, 0.65),
+            lin_vel_x=(0.4, 0.8),
             lin_vel_y=(0.0, 0.0),
             ang_vel_z=(0.0, 0.0),
         ),
@@ -214,7 +216,7 @@ class ObservationsCfg:
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05, noise=Unoise(n_min=-1.5, n_max=1.5))
         last_action = ObsTerm(func=mdp.last_action)
-        # gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.8})
+        gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.9})
 
         def __post_init__(self):
             self.history_length = 5
@@ -235,7 +237,7 @@ class ObservationsCfg:
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
         last_action = ObsTerm(func=mdp.last_action)
-        # gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.8})
+        gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.9})
         # height_scanner = ObsTerm(func=mdp.height_scan,
         #     params={"sensor_cfg": SceneEntityCfg("height_scanner")},
         #     clip=(-1.0, 5.0),
@@ -254,11 +256,11 @@ class RewardsCfg:
 
     The rewards below are ordered by the actual staged training path used for G1-23DoF:
     Stage 0 locomotion bootstrap -> Stage 1 leg gait -> Stage 2 arm-leg phase ->
-    Stage 3 shoulder swing refinement -> future/inactive refinements.
+    Stage 3 shoulder swing refinement -> Stage 4 max-plus contact timing.
 
     以下 reward 按实际训练阶段排序：
     Stage 0 前进行走基础 -> Stage 1 腿部步态 -> Stage 2 手臂-腿部相位 ->
-    Stage 3 肩关节摆臂细化 -> 后续未启用增强项。
+    Stage 3 肩关节摆臂细化 -> Stage 4 max-plus 足端接触时序。
     """
 
     # --------------------------------------------------------------------------
@@ -379,13 +381,13 @@ class RewardsCfg:
     # Stage 1：腿部步态塑形与迈腿幅度增强
     # --------------------------------------------------------------------------
 
-    # Encourage alternating left/right foot contact according to a fixed gait phase.
-    # 鼓励左右脚按固定相位交替接触地面，形成基础步态节奏。
+    # Encourage alternating left/right foot contact according to an observed gait phase.
+    # 在 policy 已观测 gait_phase 的前提下，鼓励左右脚按相位交替接触地面。
     gait = RewTerm(
         func=mdp.feet_gait,
-        weight=0.5,
+        weight=0.3,
         params={
-            "period": 0.8,
+            "period": 0.9,
             "offset": [0.0, 0.5],
             "threshold": 0.55,
             "command_name": "base_velocity",
@@ -397,7 +399,7 @@ class RewardsCfg:
     # 惩罚脚底接触地面时的滑动，减少拖脚。
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.2,
+        weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"),
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
@@ -412,7 +414,7 @@ class RewardsCfg:
         params={
             "std": 0.05,
             "tanh_mult": 2.0,
-            "target_height": 0.14,
+            "target_height": 0.17,
             "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"),
         },
     )
@@ -428,15 +430,15 @@ class RewardsCfg:
     # center_offset 将肩 pitch 摆动中心从默认偏前位置后移到更自然的位置。
     contralateral_arm_leg_phase = RewTerm(
         func=mdp.contralateral_arm_leg_phase_reward,
-        weight=0.60,
+        weight=0.45,
         params={
-            "period": 0.8,
+            "period": 0.9,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
-            "k_A": 0.90,
-            "A_min": 0.18,
-            "A_max": 0.60,
-            "sigma_contra": 0.18,
+            "k_A": 0.70,
+            "A_min": 0.12,
+            "A_max": 0.45,
+            "sigma_contra": 0.22,
             "left_sign": -1.0,
             "right_sign": 1.0,
             "center_offset": -0.30,
@@ -450,7 +452,7 @@ class RewardsCfg:
     # 弱约束左右肩 pitch 保持反相；权重较小，避免静态一前一后的坏解。
     bilateral_arm_antiphase = RewTerm(
         func=mdp.bilateral_arm_antiphase_reward,
-        weight=0.03,
+        weight=0.20,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
@@ -464,27 +466,23 @@ class RewardsCfg:
         },
     )
 
-
-
     # --------------------------------------------------------------------------
     # Stage 3: Shoulder-swing amplitude and dynamic swing refinement
     # Stage 3：肩部摆臂幅度与动态摆动细化
     # --------------------------------------------------------------------------
 
-
-
     # Reward larger shoulder-pitch swing amplitude around the shifted center.
     # 奖励围绕后移中心的大幅肩 pitch 摆臂，是当前增强“人类式摆臂幅度”的主项。
     arm_swing_amplitude = RewTerm(
         func=mdp.arm_swing_amplitude_reward,
-        weight=0.12,
+        weight=0.05,
         params={
-            "period": 0.8,
+            "period": 0.9,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
-            "k_A": 0.90,
-            "A_min": 0.18,
-            "A_max": 0.70,
+            "k_A": 0.70,
+            "A_min": 0.12,
+            "A_max": 0.45,
             "sigma_amp": 0.20,
             "left_sign": -1.0,
             "right_sign": 1.0,
@@ -517,7 +515,7 @@ class RewardsCfg:
     # 惩罚两臂共同前偏/后偏，避免“两只手都在身体前方”的姿态。
     shoulder_pitch_bias = RewTerm(
         func=mdp.shoulder_pitch_bias_penalty,
-        weight=0.3,
+        weight=1.0,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
@@ -534,14 +532,14 @@ class RewardsCfg:
     # 奖励肩 pitch 速度跟随正弦参考，促使手臂真正前后摆动，而不是静态偏置。
     arm_swing_velocity = RewTerm(
         func=mdp.arm_swing_velocity_tracking_reward,
-        weight=0.35,
+        weight=0.20,
         params={
-            "period": 0.8,
+            "period": 0.9,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
-            "k_A": 0.90,
-            "A_min": 0.18,
-            "A_max": 0.60,
+            "k_A": 0.70,
+            "A_min": 0.12,
+            "A_max": 0.45,
             "sigma_vel": 2.00,
             "left_sign": -1.0,
             "right_sign": 1.0,
@@ -572,17 +570,77 @@ class RewardsCfg:
         },
     )
     # --------------------------------------------------------------------------
-    # Stage 4: Stop behavior and inactive future refinements
-    # Stage 4：停止行为与后续未启用增强项
+    # Stage 4: Phase-guided stride correction and stop-behavior refinement
+    # Stage 4：相位引导步幅修正与停止行为细化
     # --------------------------------------------------------------------------
 
+    # Track phase-conditioned left/right sagittal foot separation.
+    # 根据 gait_phase 明确要求左右脚在不同相位轮流向前，打破“左脚长期在前、右脚跟随”的坏解。
+    feet_phase_sagittal_tracking = RewTerm(
+        func=mdp.feet_phase_sagittal_tracking_reward,
+        weight=0.45,
+        params={
+            "period": 0.9,
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "target_step_length": 0.18,
+            "sigma": 0.18,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+        },
+    )
 
+    # Reward contact-adaptive forward swing-foot placement.
+    # 根据当前支撑脚/摆动脚关系奖励摆动脚真正向前迈出，避免“左脚永远在前、右脚跟随小碎步”。
+    feet_sagittal_step_length = RewTerm(
+        func=mdp.feet_sagittal_step_length_reward,
+        weight=0.15,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "target_step_length": 0.18,
+            "sigma": 0.18,
+            "min_forward_margin": 0.04,
+            "wrong_direction_penalty": 0.6,
+            "double_support_bias_penalty": 0.2,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+        },
+    )
 
-    # Inactive: reward both feet staying in contact while stopped.
-    # 未启用：停止命令下鼓励双脚稳定接触地面。
+    # Penalize swing feet that pause in the air for too long.
+    # 惩罚摆动脚在空中停留过久，针对“右腿迈出后悬停再落地”的坏解。
+    excessive_swing_air_time = RewTerm(
+        func=mdp.excessive_swing_air_time_penalty,
+        weight=0.4,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "max_air_time": 0.35,
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    # Reward both feet staying in contact while stopped.
+    # 停止命令下鼓励双脚稳定接触地面，避免停止时继续碎步。
     maxplus_stop_leg_contact = RewTerm(
         func=mdp.maxplus_stop_leg_contact_reward,
-        weight=0.0,
+        weight=0.15,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
@@ -594,13 +652,13 @@ class RewardsCfg:
         },
     )
 
-    # Inactive: max-plus-inspired periodic contact schedule.
-    # 未启用：基于 max-plus 思路的周期足端接触时序约束。
+    # Inactive: max-plus-inspired periodic walking contact schedule.
+    # 暂时关闭基于固定时间相位的足端接触时序，避免把步态锁成固定左右前后脚坏解。
     maxplus_contact_schedule = RewTerm(
         func=mdp.maxplus_contact_schedule_reward,
         weight=0.0,
         params={
-            "period": 0.8,
+            "period": 0.9,
             "double_support_ratio": 0.15,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
@@ -618,7 +676,7 @@ class RewardsCfg:
         func=mdp.arm_trunk_stabilization_reward,
         weight=0.0,
         params={
-            "period": 0.8,
+            "period": 0.9,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
             "k_A": 0.35,

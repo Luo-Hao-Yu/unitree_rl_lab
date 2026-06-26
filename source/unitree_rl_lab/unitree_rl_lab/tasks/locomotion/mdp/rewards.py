@@ -220,6 +220,97 @@ def foot_clearance_reward(
     return torch.exp(-torch.sum(reward, dim=1) / std)
 
 
+def feet_sagittal_step_length_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    target_step_length: float = 0.18,
+    sigma: float = 0.12,
+    min_forward_margin: float = 0.05,
+    wrong_direction_penalty: float = 1.0,
+    double_support_bias_penalty: float = 0.5,
+) -> torch.Tensor:
+    """Reward contact-adaptive sagittal step length for natural alternating humanoid gait.
+
+    This term does not use an external clock. Instead, it looks at the current stance/swing relation:
+
+    * left foot contact + right foot swing -> the right foot should move ahead of the left foot;
+    * right foot contact + left foot swing -> the left foot should move ahead of the right foot.
+
+    It also penalizes the opposite relation. This is important because a pure positive reward can be ignored by
+    a policy that finds a stable "one foot always ahead" shuffle.
+
+    ``asset_cfg`` and ``sensor_cfg`` must both resolve exactly [left foot, right foot].
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    contacts = _foot_contacts(env, sensor_cfg).bool()
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+
+    foot_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :] - asset.data.root_pos_w.unsqueeze(1)
+    foot_pos_b = torch.zeros_like(foot_pos_w)
+    for index in range(len(asset_cfg.body_ids)):
+        foot_pos_b[:, index, :] = quat_apply_inverse(asset.data.root_quat_w, foot_pos_w[:, index, :])
+
+    left_x = foot_pos_b[:, 0, 0]
+    right_x = foot_pos_b[:, 1, 0]
+
+    left_stance_right_swing = contacts[:, 0] & (~contacts[:, 1])
+    right_stance_left_swing = contacts[:, 1] & (~contacts[:, 0])
+    double_support = contacts[:, 0] & contacts[:, 1]
+
+    right_ahead = right_x - left_x
+    left_ahead = left_x - right_x
+    right_swing_reward = torch.exp(-torch.square(right_ahead - target_step_length) / sigma**2)
+    left_swing_reward = torch.exp(-torch.square(left_ahead - target_step_length) / sigma**2)
+    right_swing_wrong = torch.clamp(min_forward_margin - right_ahead, min=0.0) / min_forward_margin
+    left_swing_wrong = torch.clamp(min_forward_margin - left_ahead, min=0.0) / min_forward_margin
+    double_support_bias = torch.clamp(torch.abs(left_x - right_x) - target_step_length, min=0.0) / target_step_length
+
+    reward = torch.zeros(env.num_envs, dtype=asset.data.body_pos_w.dtype, device=env.device)
+    reward += left_stance_right_swing.to(reward.dtype) * right_swing_reward
+    reward += right_stance_left_swing.to(reward.dtype) * left_swing_reward
+    reward -= wrong_direction_penalty * left_stance_right_swing.to(reward.dtype) * right_swing_wrong
+    reward -= wrong_direction_penalty * right_stance_left_swing.to(reward.dtype) * left_swing_wrong
+    reward -= double_support_bias_penalty * double_support.to(reward.dtype) * double_support_bias
+    return walk_mask * reward
+
+
+def feet_phase_sagittal_tracking_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    period: float = 0.9,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    target_step_length: float = 0.24,
+    sigma: float = 0.12,
+) -> torch.Tensor:
+    """Track phase-conditioned left/right sagittal foot separation.
+
+    The target is expressed as ``left_x - right_x`` in the robot base frame:
+
+    * phase ~= 0.25 -> right foot should be ahead, so ``left_x - right_x`` is negative;
+    * phase ~= 0.75 -> left foot should be ahead, so ``left_x - right_x`` is positive.
+
+    Unlike the contact-adaptive term, this gives the policy a clear external gait clock when paired with the
+    ``gait_phase`` observation.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    phase = _gait_phase(env, period)
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+
+    foot_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :] - asset.data.root_pos_w.unsqueeze(1)
+    foot_pos_b = torch.zeros_like(foot_pos_w)
+    for index in range(len(asset_cfg.body_ids)):
+        foot_pos_b[:, index, :] = quat_apply_inverse(asset.data.root_quat_w, foot_pos_w[:, index, :])
+
+    left_minus_right_x = foot_pos_b[:, 0, 0] - foot_pos_b[:, 1, 0]
+    desired_left_minus_right_x = -target_step_length * torch.sin(2.0 * torch.pi * phase)
+    error = torch.square(left_minus_right_x - desired_left_minus_right_x)
+    return walk_mask * torch.exp(-error / sigma**2)
+
+
 def feet_too_near(
     env: ManagerBasedRLEnv, threshold: float = 0.2, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -256,6 +347,25 @@ def air_time_variance_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg
     return torch.var(torch.clip(last_air_time, max=0.5), dim=1) + torch.var(
         torch.clip(last_contact_time, max=0.5), dim=1
     )
+
+
+def excessive_swing_air_time_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    max_air_time: float = 0.35,
+) -> torch.Tensor:
+    """Penalize feet that stay in the air too long while walking.
+
+    This targets the local optimum where a swing leg reaches forward, pauses in the air, and only then lands.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    if contact_sensor.cfg.track_air_time is False:
+        raise RuntimeError("Activate ContactSensor's track_air_time!")
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+    current_air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]
+    return -walk_mask * torch.sum(torch.clamp(current_air_time - max_air_time, min=0.0), dim=-1)
 
 
 """
