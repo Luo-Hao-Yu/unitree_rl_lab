@@ -320,7 +320,7 @@ class RewardsCfg:
     # 约束肩 roll/yaw、肘、腕靠近默认姿态；不约束 shoulder pitch，避免压制主动摆臂。
     joint_deviation_arms = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.02,
+        weight=0.0,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot",
@@ -430,15 +430,15 @@ class RewardsCfg:
     # center_offset 将肩 pitch 摆动中心从默认偏前位置后移到更自然的位置。
     contralateral_arm_leg_phase = RewTerm(
         func=mdp.contralateral_arm_leg_phase_reward,
-        weight=0.45,
+        weight=0.0,
         params={
             "period": 0.9,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
-            "k_A": 0.70,
-            "A_min": 0.12,
-            "A_max": 0.45,
-            "sigma_contra": 0.22,
+            "k_A": 0.75,
+            "A_min": 0.14,
+            "A_max": 0.50,
+            "sigma_contra": 0.18,
             "left_sign": -1.0,
             "right_sign": 1.0,
             "center_offset": -0.30,
@@ -452,7 +452,7 @@ class RewardsCfg:
     # 弱约束左右肩 pitch 保持反相；权重较小，避免静态一前一后的坏解。
     bilateral_arm_antiphase = RewTerm(
         func=mdp.bilateral_arm_antiphase_reward,
-        weight=0.20,
+        weight=0.0,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
@@ -471,18 +471,18 @@ class RewardsCfg:
     # Stage 3：肩部摆臂幅度与动态摆动细化
     # --------------------------------------------------------------------------
 
-    # Reward larger shoulder-pitch swing amplitude around the shifted center.
-    # 奖励围绕后移中心的大幅肩 pitch 摆臂，是当前增强“人类式摆臂幅度”的主项。
+    # Reward a moderate shoulder-pitch swing amplitude around the shifted center.
+    # 奖励围绕后移中心的适中肩 pitch 摆幅，保留自然摆臂并限制摆动过大。
     arm_swing_amplitude = RewTerm(
         func=mdp.arm_swing_amplitude_reward,
-        weight=0.05,
+        weight=0.0,
         params={
             "period": 0.9,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
-            "k_A": 0.70,
-            "A_min": 0.12,
-            "A_max": 0.45,
+            "k_A": 0.75,
+            "A_min": 0.14,
+            "A_max": 0.55,
             "sigma_amp": 0.20,
             "left_sign": -1.0,
             "right_sign": 1.0,
@@ -497,7 +497,7 @@ class RewardsCfg:
     # 约束肘和腕保持自然，避免用肘部小抖动代替肩部摆臂；不约束 shoulder pitch。
     arm_natural_posture = RewTerm(
         func=mdp.arm_natural_posture_penalty,
-        weight=0.03,
+        weight=0.0,
         params={
             "position_weight": 1.0,
             "velocity_weight": 0.05,
@@ -515,7 +515,7 @@ class RewardsCfg:
     # 惩罚两臂共同前偏/后偏，避免“两只手都在身体前方”的姿态。
     shoulder_pitch_bias = RewTerm(
         func=mdp.shoulder_pitch_bias_penalty,
-        weight=1.0,
+        weight=0.0,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
@@ -532,14 +532,14 @@ class RewardsCfg:
     # 奖励肩 pitch 速度跟随正弦参考，促使手臂真正前后摆动，而不是静态偏置。
     arm_swing_velocity = RewTerm(
         func=mdp.arm_swing_velocity_tracking_reward,
-        weight=0.20,
+        weight=0.0,
         params={
             "period": 0.9,
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
-            "k_A": 0.70,
-            "A_min": 0.12,
-            "A_max": 0.45,
+            "k_A": 0.75,
+            "A_min": 0.14,
+            "A_max": 0.50,
             "sigma_vel": 2.00,
             "left_sign": -1.0,
             "right_sign": 1.0,
@@ -554,7 +554,7 @@ class RewardsCfg:
     # 停止命令下惩罚手臂偏离和速度，使站立时手臂逐渐安静。
     stop_arm_settle = RewTerm(
         func=mdp.stop_arm_settle_reward,
-        weight=0.05,
+        weight=0.0,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": 0.05,
@@ -632,6 +632,104 @@ class RewardsCfg:
                 "contact_forces",
                 body_names=["left_ankle_roll_link", "right_ankle_roll_link"],
                 preserve_order=True,
+            ),
+        },
+    )
+
+    # Reward visual/physical anti-phase shoulder pitch, independent of left/right sign normalization.
+    # 使用未乘 sign 的物理肩 pitch 偏移和速度，直接奖励两臂视觉上反向摆动。
+    physical_bilateral_arm_antiphase = RewTerm(
+        func=mdp.physical_bilateral_arm_antiphase_reward,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "sigma_pos": 0.50,
+            "sigma_vel": 3.00,
+            "velocity_weight": 0.15,
+            "center_offset": -0.30,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
+            ),
+        },
+    )
+
+    # Penalize both arms moving forward/backward together in physical shoulder-pitch coordinates.
+    # 惩罚两臂在物理肩 pitch 坐标下同向前后摆，针对“两条手同时往前伸”的坏解。
+    physical_arm_common_motion = RewTerm(
+        func=mdp.physical_arm_common_motion_penalty,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "position_weight": 0.6,
+            "velocity_weight": 0.04,
+            "center_offset": -0.30,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
+            ),
+        },
+    )
+
+    # Penalize both wrist links moving forward/backward together in the body sagittal direction.
+    # 直接约束左右手腕末端的前后速度，针对视觉上的“两只手同时向前/向后摆”。
+    wrist_sagittal_common_velocity = RewTerm(
+        func=mdp.wrist_sagittal_common_velocity_penalty,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "velocity_weight": 1.0,
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=["left_wrist_roll_rubber_hand", "right_wrist_roll_rubber_hand"], preserve_order=True
+            ),
+        },
+    )
+
+    # Penalize too-small shoulder-pitch swing amplitude without rewarding unlimited overshoot.
+    # 只惩罚摆幅低于目标的情况，专门把手臂从“小幅冻结”局部最优里推出来。
+    arm_swing_min_amplitude = RewTerm(
+        func=mdp.arm_swing_min_amplitude_penalty,
+        weight=0.0,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "k_A": 0.90,
+            "A_min": 0.18,
+            "A_max": 0.60,
+            "left_sign": -1.0,
+            "right_sign": 1.0,
+            "center_offset": -0.30,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
+            ),
+        },
+    )
+
+    # --------------------------------------------------------------------------
+    # Stage 5: Left-arm dynamic swing correction
+    # Stage 5：左臂动态摆动纠偏
+    # --------------------------------------------------------------------------
+
+    # Dense signed phase penalty with stronger left-arm weight.
+    # 使用密集型有符号相位误差惩罚，专门防止左臂停在前方小幅抖动而不真正前后摆。
+    left_arm_phase_tracking = RewTerm(
+        func=mdp.arm_swing_phase_tracking_penalty,
+        weight=0.0,
+        params={
+            "period": 0.9,
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "k_A": 0.90,
+            "A_min": 0.20,
+            "A_max": 0.65,
+            "left_sign": -1.0,
+            "right_sign": 1.0,
+            "center_offset": -0.30,
+            "left_weight": 3.0,
+            "right_weight": 0.4,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=["left_shoulder_pitch_joint", "right_shoulder_pitch_joint"], preserve_order=True
             ),
         },
     )

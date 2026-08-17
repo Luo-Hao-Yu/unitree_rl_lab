@@ -64,6 +64,24 @@ def _shoulder_pitch_relative(
     return asset, left_arm, right_arm
 
 
+def _shoulder_pitch_physical_relative(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    center_offset: float = 0.0,
+) -> tuple[Articulation, torch.Tensor, torch.Tensor]:
+    """Return raw left/right shoulder-pitch offsets from the shifted physical joint center.
+
+    This intentionally does not apply ``left_sign``/``right_sign``. It is used to detect visual/physical
+    same-direction arm swing, which can be hidden by sign-normalized arm coordinates.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    shoulder_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    shoulder_center = asset.data.default_joint_pos[:, asset_cfg.joint_ids] + center_offset
+    if shoulder_pos.shape[1] != 2:
+        raise ValueError(f"Expected exactly two shoulder-pitch joints, got {shoulder_pos.shape[1]}.")
+    return asset, shoulder_pos[:, 0] - shoulder_center[:, 0], shoulder_pos[:, 1] - shoulder_center[:, 1]
+
+
 def _arm_reference(
     env: ManagerBasedRLEnv,
     period: float,
@@ -95,13 +113,17 @@ def _contralateral_error(
     left_sign: float,
     right_sign: float,
     center_offset: float = 0.0,
+    left_weight: float = 1.0,
+    right_weight: float = 1.0,
 ) -> tuple[Articulation, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return the articulation, walking mask, arm variables, and contralateral squared error."""
     asset, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign, center_offset)
     walk_mask, _, left_reference, right_reference = _arm_reference(
         env, period, command_name, cmd_threshold, k_A, A_min, A_max
     )
-    error = torch.square(left_arm - left_reference) + torch.square(right_arm - right_reference)
+    error = left_weight * torch.square(left_arm - left_reference) + right_weight * torch.square(
+        right_arm - right_reference
+    )
     arms = torch.stack((left_arm, right_arm), dim=-1)
     return asset, walk_mask, arms, error
 
@@ -465,6 +487,8 @@ def contralateral_arm_leg_phase_reward(
     left_sign: float = 1.0,
     right_sign: float = 1.0,
     center_offset: float = 0.0,
+    left_weight: float = 1.0,
+    right_weight: float = 1.0,
 ) -> torch.Tensor:
     """Reward shoulder-pitch tracking of a contralateral arm-leg phase reference.
 
@@ -484,6 +508,8 @@ def contralateral_arm_leg_phase_reward(
         left_sign,
         right_sign,
         center_offset,
+        left_weight,
+        right_weight,
     )
     return walk_mask * torch.exp(-error / sigma_contra**2)
 
@@ -501,6 +527,8 @@ def arm_swing_amplitude_reward(
     left_sign: float = 1.0,
     right_sign: float = 1.0,
     center_offset: float = 0.0,
+    left_weight: float = 1.0,
+    right_weight: float = 1.0,
 ) -> torch.Tensor:
     """Reward both shoulder-pitch amplitudes for matching the speed-scaled reference amplitude.
 
@@ -513,8 +541,38 @@ def arm_swing_amplitude_reward(
     command = env.command_manager.get_command(command_name)
     _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
     amplitude = torch.clamp(k_A * torch.abs(command[:, 0]), min=A_min, max=A_max)
-    error = torch.square(torch.abs(left_arm) - amplitude) + torch.square(torch.abs(right_arm) - amplitude)
+    error = left_weight * torch.square(torch.abs(left_arm) - amplitude) + right_weight * torch.square(
+        torch.abs(right_arm) - amplitude
+    )
     return walk_mask * torch.exp(-error / sigma_amp**2)
+
+
+def arm_swing_min_amplitude_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    k_A: float = 0.35,
+    A_min: float = 0.03,
+    A_max: float = 0.25,
+    left_sign: float = 1.0,
+    right_sign: float = 1.0,
+    center_offset: float = 0.0,
+    left_weight: float = 1.0,
+    right_weight: float = 1.0,
+) -> torch.Tensor:
+    """Penalize shoulder-pitch swing amplitudes below the speed-scaled target.
+
+    Unlike ``arm_swing_amplitude_reward``, this is one-sided: it only pushes arms out of the near-zero
+    amplitude local optimum and does not keep rewarding amplitudes above the target.
+    """
+    _, left_arm, right_arm = _shoulder_pitch_relative(env, asset_cfg, left_sign, right_sign, center_offset)
+    command = env.command_manager.get_command(command_name)
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+    amplitude = torch.clamp(k_A * torch.abs(command[:, 0]), min=A_min, max=A_max)
+    left_shortfall = torch.clamp(amplitude - torch.abs(left_arm), min=0.0)
+    right_shortfall = torch.clamp(amplitude - torch.abs(right_arm), min=0.0)
+    return -walk_mask * (left_weight * torch.square(left_shortfall) + right_weight * torch.square(right_shortfall))
 
 
 def arm_swing_velocity_tracking_reward(
@@ -530,6 +588,8 @@ def arm_swing_velocity_tracking_reward(
     left_sign: float = 1.0,
     right_sign: float = 1.0,
     center_offset: float = 0.0,
+    left_weight: float = 1.0,
+    right_weight: float = 1.0,
 ) -> torch.Tensor:
     """Reward dynamic shoulder-pitch swing velocity around the default pose.
 
@@ -552,10 +612,48 @@ def arm_swing_velocity_tracking_reward(
     left_velocity = left_sign * shoulder_vel[:, 0]
     right_velocity = right_sign * shoulder_vel[:, 1]
 
-    error = torch.square(left_velocity - left_velocity_reference) + torch.square(
+    error = left_weight * torch.square(left_velocity - left_velocity_reference) + right_weight * torch.square(
         right_velocity - right_velocity_reference
     )
     return walk_mask * torch.exp(-error / sigma_vel**2)
+
+
+def arm_swing_phase_tracking_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    period: float = 0.8,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    k_A: float = 0.35,
+    A_min: float = 0.03,
+    A_max: float = 0.25,
+    left_sign: float = 1.0,
+    right_sign: float = 1.0,
+    center_offset: float = 0.0,
+    left_weight: float = 1.0,
+    right_weight: float = 1.0,
+) -> torch.Tensor:
+    """Dense signed shoulder-pitch phase-tracking penalty.
+
+    The exponential phase reward can become weak when one arm falls into a static-offset local optimum. This
+    dense negative term keeps a useful gradient on the lagging arm, especially for asymmetric left/right tuning.
+    """
+    _, walk_mask, _, error = _contralateral_error(
+        env,
+        period,
+        command_name,
+        cmd_threshold,
+        k_A,
+        A_min,
+        A_max,
+        asset_cfg,
+        left_sign,
+        right_sign,
+        center_offset,
+        left_weight,
+        right_weight,
+    )
+    return -walk_mask * error
 
 
 def shoulder_pitch_bias_penalty(
@@ -597,6 +695,80 @@ def bilateral_arm_antiphase_reward(
     _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
     error = torch.square(left_arm + right_arm)
     return walk_mask * torch.exp(-error / sigma_anti**2)
+
+
+def physical_bilateral_arm_antiphase_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    sigma_pos: float = 0.20,
+    sigma_vel: float = 1.50,
+    velocity_weight: float = 0.5,
+    center_offset: float = 0.0,
+) -> torch.Tensor:
+    """Reward visual/physical anti-phase shoulder-pitch motion.
+
+    This uses raw shoulder-pitch offsets and velocities instead of sign-normalized arm coordinates. It directly
+    penalizes both arms moving forward/backward together, which may otherwise be misclassified as anti-phase when
+    left/right joint axes are sign-normalized differently.
+    """
+    asset, left_arm, right_arm = _shoulder_pitch_physical_relative(env, asset_cfg, center_offset)
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+    shoulder_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    if shoulder_vel.shape[1] != 2:
+        raise ValueError(f"Expected exactly two shoulder-pitch joints, got {shoulder_vel.shape[1]}.")
+    position_error = torch.square(left_arm + right_arm)
+    velocity_error = torch.square(shoulder_vel[:, 0] + shoulder_vel[:, 1])
+    return walk_mask * torch.exp(-position_error / sigma_pos**2 - velocity_weight * velocity_error / sigma_vel**2)
+
+
+def physical_arm_common_motion_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    position_weight: float = 1.0,
+    velocity_weight: float = 0.1,
+    center_offset: float = 0.0,
+) -> torch.Tensor:
+    """Penalize physical common-mode shoulder-pitch position and velocity while walking."""
+    asset, left_arm, right_arm = _shoulder_pitch_physical_relative(env, asset_cfg, center_offset)
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+    shoulder_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    if shoulder_vel.shape[1] != 2:
+        raise ValueError(f"Expected exactly two shoulder-pitch joints, got {shoulder_vel.shape[1]}.")
+    common_position = 0.5 * (left_arm + right_arm)
+    common_velocity = 0.5 * (shoulder_vel[:, 0] + shoulder_vel[:, 1])
+    return -walk_mask * (position_weight * torch.square(common_position) + velocity_weight * torch.square(common_velocity))
+
+
+def wrist_sagittal_common_velocity_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    velocity_weight: float = 1.0,
+) -> torch.Tensor:
+    """Penalize left/right wrist links moving forward or backward together in the robot body frame.
+
+    Shoulder-pitch rewards can miss visually same-direction arm swing when the policy uses elbow, shoulder roll/yaw,
+    or wrist motion to make the hands move together. This term acts directly on the wrist-link sagittal velocity.
+    ``asset_cfg`` must resolve left then right wrist links.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, walk_mask, _ = _command_masks(env, command_name, cmd_threshold)
+
+    wrist_vel_w = asset.data.body_lin_vel_w[:, asset_cfg.body_ids] - asset.data.root_lin_vel_w[:, :].unsqueeze(1)
+    if wrist_vel_w.shape[1] != 2:
+        raise ValueError(f"Expected exactly two wrist bodies, got {wrist_vel_w.shape[1]}.")
+
+    wrist_vel_b = torch.zeros_like(wrist_vel_w)
+    for i in range(2):
+        wrist_vel_b[:, i, :] = quat_apply_inverse(asset.data.root_quat_w, wrist_vel_w[:, i, :])
+
+    common_sagittal_velocity = 0.5 * (wrist_vel_b[:, 0, 0] + wrist_vel_b[:, 1, 0])
+    return -walk_mask * velocity_weight * torch.square(common_sagittal_velocity)
 
 
 def arm_natural_posture_penalty(

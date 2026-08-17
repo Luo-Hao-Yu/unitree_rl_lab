@@ -40,6 +40,7 @@ docker/.container.cfg
 **/videos/*
 **/wandb/*
 **/.neptune/*
+/logs_trash/
 docker/artifacts/
 *.tmp
 *.bak
