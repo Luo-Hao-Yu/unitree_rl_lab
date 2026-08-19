@@ -8,11 +8,23 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_apply, quat_apply_inverse
 from isaaclab_tasks.direct.humanoid_amp.motions import MotionLoader
 
 from .g1_amp_env_cfg import G1AmpEnvCfg
 from .multi_motion_loader import MultiMotionLoader, MultiMotionSampleContext
+
+
+def reference_state_command(
+    reference_rotation_w: torch.Tensor,
+    reference_linear_velocity_w: torch.Tensor,
+    reference_angular_velocity_w: torch.Tensor,
+) -> torch.Tensor:
+    """Return the body-frame [vx, vy, yaw_rate] command of a reference state."""
+
+    linear_velocity_b = quat_apply_inverse(reference_rotation_w, reference_linear_velocity_w)
+    angular_velocity_b = quat_apply_inverse(reference_rotation_w, reference_angular_velocity_w)
+    return torch.cat((linear_velocity_b[:, :2], angular_velocity_b[:, 2:3]), dim=-1)
 
 
 class G1AmpEnv(DirectRLEnv):
@@ -71,6 +83,7 @@ class G1AmpEnv(DirectRLEnv):
         self._velocity_command = torch.tensor(
             self.cfg.velocity_command, dtype=torch.float32, device=self.device
         ).repeat(self.num_envs, 1)
+        self._fallback_velocity_command = self._velocity_command.clone()
 
         self.amp_observation_size = self.cfg.num_amp_observations * self.cfg.amp_observation_space
         self._motion_loader: MotionLoader | MultiMotionLoader | None = None
@@ -203,12 +216,18 @@ class G1AmpEnv(DirectRLEnv):
             self.robot.data.body_ang_vel_w[:, self.reference_body_id],
             self.robot.data.body_pos_w[:, self.key_body_ids],
         )
+        # A reset preloads the complete same-clip reference history. Keep it
+        # intact for this first policy/discriminator observation: immediately
+        # replacing frame 0 with articulation-derived link velocities would
+        # make an otherwise exact RSI history inconsistent at its current
+        # frame. From the next simulation step onward every environment is
+        # regular and receives policy-generated AMP observations as usual.
         regular_envs = ~self._rsi_history_pending
         for index in reversed(range(self.cfg.num_amp_observations - 1)):
             self.amp_observation_buffer[regular_envs, index + 1] = self.amp_observation_buffer[
                 regular_envs, index
             ]
-        self.amp_observation_buffer[:, 0] = amp_obs
+        self.amp_observation_buffer[regular_envs, 0] = amp_obs[regular_envs]
         self._rsi_history_pending[:] = False
         self.extras = {
             "amp_obs": self.amp_observation_buffer.view(self.num_envs, self.amp_observation_size),
@@ -222,18 +241,31 @@ class G1AmpEnv(DirectRLEnv):
         velocity_error = torch.sum(
             torch.square(self.robot.data.root_lin_vel_b[:, :2] - self._velocity_command[:, :2]), dim=-1
         )
-        velocity_tracking = torch.exp(-velocity_error / 0.25)
+        yaw_rate_error = torch.square(self.robot.data.root_ang_vel_b[:, 2] - self._velocity_command[:, 2])
+        velocity_tracking = torch.exp(-velocity_error / self.cfg.linear_velocity_tracking_sigma)
+        yaw_rate_tracking = torch.exp(-yaw_rate_error / self.cfg.yaw_rate_tracking_sigma)
         upright = torch.exp(-torch.sum(torch.square(self.robot.data.projected_gravity_b[:, :2]), dim=-1) / 0.25)
         angular_stability = torch.sum(torch.square(self.robot.data.root_ang_vel_b[:, :2]), dim=-1)
-        task_reward = velocity_tracking + 0.25 * upright + 0.05 - 0.02 * angular_stability
+        task_reward = (
+            velocity_tracking
+            + self.cfg.yaw_rate_tracking_weight * yaw_rate_tracking
+            + 0.25 * upright
+            + 0.05
+            - 0.02 * angular_stability
+        )
         self._task_metrics = {
             "task_reward": task_reward,
             "velocity_tracking_error": velocity_error,
             "velocity_tracking_reward": velocity_tracking,
+            "yaw_rate_tracking_error": yaw_rate_error,
+            "yaw_rate_tracking_reward": yaw_rate_tracking,
             "upright_reward": upright,
             "angular_stability_cost": angular_stability,
             "episode_length": self.episode_length_buf.to(dtype=torch.float32),
             "root_height": self.robot.data.root_pos_w[:, 2],
+            "command_vx": self._velocity_command[:, 0],
+            "command_vy": self._velocity_command[:, 1],
+            "command_yaw_rate": self._velocity_command[:, 2],
         }
         return task_reward
 
@@ -260,6 +292,7 @@ class G1AmpEnv(DirectRLEnv):
         self._last_rsi_times[env_ids] = torch.nan
         self._last_rsi_frame_indices[env_ids] = -1
         self._last_rsi_motion_indices[env_ids] = -1
+        self._velocity_command[env_ids] = self._fallback_velocity_command[env_ids]
 
         if self.cfg.reset_strategy == "default":
             root_state, joint_pos, joint_vel = self._reset_strategy_default(env_ids)
@@ -346,6 +379,12 @@ class G1AmpEnv(DirectRLEnv):
             raise RuntimeError("RSI sampled state contains NaN/Inf.")
 
         assert self.motion_root_body_index is not None
+        if isinstance(self._motion_loader, MultiMotionLoader) and self.cfg.command_from_reference_state:
+            self._velocity_command[env_ids] = reference_state_command(
+                body_rotations[:, self.motion_root_body_index],
+                body_linear_velocities[:, self.motion_root_body_index],
+                body_angular_velocities[:, self.motion_root_body_index],
+            )
         root_state = self.robot.data.default_root_state[env_ids].clone()
         sampled_root_position = body_positions[:, self.motion_root_body_index]
         if isinstance(self._motion_loader, MultiMotionLoader):

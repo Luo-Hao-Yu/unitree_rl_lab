@@ -43,6 +43,7 @@ import torch
 import isaaclab_tasks  # noqa: F401
 import unitree_rl_lab.tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
+from isaaclab.utils.math import quat_apply_inverse
 
 
 def _maximum_quaternion_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -106,6 +107,27 @@ def main(env_cfg, _agent_cfg: dict) -> None:
         total_motion_frames = [int(loader.num_frames)]
     dof_pos, dof_vel, body_pos, body_quat, body_lin_vel, body_ang_vel = sampled
     root_index = raw_env.motion_root_body_index
+    command_reference_error = None
+    command_summary = {
+        "source": "fixed fallback velocity_command",
+        "vx_minimum": float(raw_env._velocity_command[:, 0].min().item()),
+        "vx_maximum": float(raw_env._velocity_command[:, 0].max().item()),
+        "vy_minimum": float(raw_env._velocity_command[:, 1].min().item()),
+        "vy_maximum": float(raw_env._velocity_command[:, 1].max().item()),
+        "yaw_rate_minimum": float(raw_env._velocity_command[:, 2].min().item()),
+        "yaw_rate_maximum": float(raw_env._velocity_command[:, 2].max().item()),
+    }
+    if is_multi_motion and raw_env.cfg.command_from_reference_state:
+        expected_command = torch.cat(
+            (
+                quat_apply_inverse(body_quat[:, root_index], body_lin_vel[:, root_index])[:, :2],
+                quat_apply_inverse(body_quat[:, root_index], body_ang_vel[:, root_index])[:, 2:3],
+            ),
+            dim=-1,
+        )
+        command_reference_error = float(torch.abs(raw_env._velocity_command - expected_command).max().item())
+        command_summary["source"] = "selected reference root state in body frame"
+        command_summary["reference_state_max_abs_error"] = command_reference_error
     expected_root_position = body_pos[:, root_index].clone()
     expected_root_position[:, :2] = (
         expected_root_position[:, :2]
@@ -182,6 +204,7 @@ def main(env_cfg, _agent_cfg: dict) -> None:
             "heading": "reference world quaternion preserved unchanged (wxyz)",
             "velocities": "reference world-frame root linear/angular velocities preserved unchanged",
         },
+        "commands": command_summary,
         "all_finite": bool(
             torch.all(torch.isfinite(policy_history))
             and torch.all(torch.isfinite(actual_joint_pos))
@@ -189,6 +212,11 @@ def main(env_cfg, _agent_cfg: dict) -> None:
             and torch.all(torch.isfinite(raw_env.robot.data.root_link_state_w))
         ),
     }
+    if command_reference_error is not None and command_reference_error > 1.0e-5:
+        raise RuntimeError(
+            "RSI command/reference mismatch: "
+            f"maximum absolute error is {command_reference_error:.6g}."
+        )
     args_cli.output.parent.mkdir(parents=True, exist_ok=True)
     args_cli.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))

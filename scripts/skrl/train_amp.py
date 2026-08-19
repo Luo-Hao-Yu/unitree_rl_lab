@@ -35,7 +35,7 @@ simulation_app = app_launcher.app
 import json
 import math
 import random
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -126,10 +126,15 @@ class InstrumentedAMP(AMP):
         info_tags = {
             "velocity_tracking_error": "Task / Velocity tracking error",
             "velocity_tracking_reward": "Task / Velocity tracking reward",
+            "yaw_rate_tracking_error": "Task / Yaw-rate tracking error",
+            "yaw_rate_tracking_reward": "Task / Yaw-rate tracking reward",
             "upright_reward": "Safety / Upright reward",
             "angular_stability_cost": "Safety / Angular stability cost",
             "episode_length": "Episode / Current length mean",
             "root_height": "Safety / Root height mean",
+            "command_vx": "Command / vx mean",
+            "command_vy": "Command / vy mean",
+            "command_yaw_rate": "Command / yaw-rate mean",
         }
         for info_name, tag in info_tags.items():
             if info_name in infos:
@@ -279,8 +284,11 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
     agent_cfg["trainer"]["timesteps"] = args_cli.max_iterations * rollouts
     agent_cfg["trainer"]["close_environment_at_exit"] = False
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_name = f"{timestamp}_amp_torch_{args_cli.run_name}"
+    # Isaac Sim containers commonly use UTC and may not ship IANA tzdata. Beijing
+    # time is UTC+8 year-round, so use a fixed offset without external tzdata.
+    beijing_tz = timezone(timedelta(hours=8), name="CST")
+    timestamp = datetime.now(beijing_tz).strftime("%Y-%m-%d_%H-%M-%S")
+    run_name = f"{timestamp}_{args_cli.run_name}"
     log_root = Path("logs/skrl") / agent_cfg["agent"]["experiment"]["directory"]
     log_root = log_root.resolve()
     log_dir = log_root / run_name
@@ -297,7 +305,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict) -> None:
     print(f"[INFO] AMP updates requested: {args_cli.max_iterations}")
     print(f"[INFO] Task/style weights: {agent_cfg['agent']['task_reward_weight']} / "
           f"{agent_cfg['agent']['style_reward_weight']}")
-    print(f"[INFO] Reference motion: {env_cfg.motion_file}")
+    print(f"[INFO] Reference manifest: {env_cfg.motion_manifest}")
+    print(f"[INFO] Single-motion fallback file: {env_cfg.motion_file}")
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     reference_probe = env.unwrapped.collect_reference_motions(8)

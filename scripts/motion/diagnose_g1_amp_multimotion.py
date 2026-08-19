@@ -70,6 +70,7 @@ def main(args: argparse.Namespace) -> None:
             raise RuntimeError(f"History timing is inconsistent at row {row}.")
 
     dof_indices = loader.get_dof_index(list(policy_joint_names))
+    motion_root_body_index = loader.get_body_index(["pelvis"])[0]
     reference_body_index = loader.get_body_index(["torso_link"])[0]
     key_body_indices = loader.get_body_index(list(key_body_names))
     amp_frames = compute_amp_observation(
@@ -111,6 +112,37 @@ def main(args: argparse.Namespace) -> None:
     if any(clip_counts[motion_id] == 0 for motion_id in loader.motion_ids):
         raise RuntimeError("At least one active clip was never sampled.")
 
+    # Commands used by RSI are not precomputed labels: they are derived from
+    # the selected reference root state in its own body frame. Calculate their
+    # complete-dataset range here, rather than estimating it from random rows.
+    command_trajectories: list[torch.Tensor] = []
+    for motion_id, motion in zip(loader.motion_ids, loader.loaders):
+        reference_commands = env_module.reference_state_command(
+            motion.body_rotations[:, motion_root_body_index],
+            motion.body_linear_velocities[:, motion_root_body_index],
+            motion.body_angular_velocities[:, motion_root_body_index],
+        )
+        if not torch.all(torch.isfinite(reference_commands)):
+            raise RuntimeError(f"Reference-state command contains NaN/Inf: {motion_id}")
+        command_trajectories.append(reference_commands)
+    all_reference_commands = torch.cat(command_trajectories, dim=0)
+    command_ranges = {
+        "source": "reference pelvis state transformed from world to pelvis/body frame",
+        "frame_count": int(all_reference_commands.shape[0]),
+        "vx": {
+            "minimum": float(all_reference_commands[:, 0].min().item()),
+            "maximum": float(all_reference_commands[:, 0].max().item()),
+        },
+        "vy": {
+            "minimum": float(all_reference_commands[:, 1].min().item()),
+            "maximum": float(all_reference_commands[:, 1].max().item()),
+        },
+        "yaw_rate": {
+            "minimum": float(all_reference_commands[:, 2].min().item()),
+            "maximum": float(all_reference_commands[:, 2].max().item()),
+        },
+    }
+
     observed_clips = {
         motion_id: clip_counts[motion_id] / args.num_samples for motion_id in loader.motion_ids
     }
@@ -131,6 +163,7 @@ def main(args: argparse.Namespace) -> None:
         "maximum_absolute_category_error": maximum_category_error,
         "observed_clip_probabilities": observed_clips,
         "clip_categories": dict(zip(loader.motion_ids, loader.motion_categories)),
+        "reference_state_command_ranges": command_ranges,
     }
     output_path = args.output_json
     if output_path is None:

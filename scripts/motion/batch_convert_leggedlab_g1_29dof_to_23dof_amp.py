@@ -35,6 +35,12 @@ EXPECTED_REMOVED_DOFS = [
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--motion-set",
+        choices=("selected", "all"),
+        default="selected",
+        help="Convert the old balanced selection or every record discovered in the analysis report.",
+    )
     parser.add_argument("--source-motion-dir", type=Path, required=True)
     parser.add_argument("--source-config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -56,6 +62,12 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Capture six Isaac camera frames per valid clip during replay",
+    )
+    parser.add_argument(
+        "--require-all-valid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail after writing the manifest if any requested clip does not pass conversion and replay validation.",
     )
     return parser.parse_args()
 
@@ -170,6 +182,36 @@ def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _global_reference_center(valid_entries: list[dict[str, Any]], output_dir: Path) -> dict[str, Any]:
+    """Return the one static 23-DoF median target center over every valid frame."""
+
+    trajectories: list[np.ndarray] = []
+    joint_names: list[str] | None = None
+    for entry in valid_entries:
+        path = output_dir / entry["converted_npz_path"]
+        with np.load(path) as archive:
+            current_names = archive["dof_names"].tolist()
+            positions = np.asarray(archive["dof_positions"], dtype=np.float64)
+        if joint_names is None:
+            joint_names = current_names
+        elif current_names != joint_names:
+            raise RuntimeError(f"DoF ordering differs while computing global center: {entry['motion_id']}")
+        if positions.ndim != 2 or positions.shape[1] != 23 or not np.all(np.isfinite(positions)):
+            raise RuntimeError(f"Invalid converted position trajectory: {entry['motion_id']}")
+        trajectories.append(positions)
+    if not trajectories or joint_names is None:
+        raise RuntimeError("Cannot compute a global reference center without valid converted motions.")
+    all_positions = np.concatenate(trajectories, axis=0)
+    center = np.median(all_positions, axis=0)
+    return {
+        "method": "per_joint_median_over_all_frames_of_all_valid_clips",
+        "clip_count": len(valid_entries),
+        "frame_count": int(all_positions.shape[0]),
+        "joint_order": joint_names,
+        "center": center.tolist(),
+    }
+
+
 def main() -> None:
     args = _parse_args()
     project_root = Path(__file__).resolve().parents[2]
@@ -186,16 +228,19 @@ def main() -> None:
     clips_dir.mkdir(parents=True, exist_ok=True)
 
     candidate_data = json.loads(candidate_manifest.read_text(encoding="utf-8"))
-    candidates = candidate_data.get("selected")
-    if not isinstance(candidates, list) or len(candidates) != 13:
-        raise RuntimeError(f"Expected exactly 13 selected candidates, found {len(candidates or [])}.")
+    record_key = "records" if args.motion_set == "all" else "selected"
+    candidates = candidate_data.get(record_key)
+    if not isinstance(candidates, list) or not candidates:
+        raise RuntimeError(f"Expected a non-empty {record_key!r} list in {candidate_manifest}.")
 
     motions: list[dict[str, Any]] = []
     motion_ids: set[str] = set()
     manifest_path = output_dir / "g1_23dof_amp_multimotion_manifest.json"
     for candidate in candidates:
         filename = candidate["filename"]
-        category = candidate["category"]
+        category = candidate.get("category", candidate.get("kinematic_category"))
+        if not isinstance(category, str) or not category:
+            raise ValueError(f"Motion {filename!r} does not define a category.")
         motion_id = _slug(filename)
         if motion_id in motion_ids:
             raise RuntimeError(f"Duplicate generated motion_id: {motion_id}")
@@ -290,8 +335,9 @@ def main() -> None:
             entry["traceback"] = traceback.format_exc()
 
         provisional = {
-            "schema_version": 1,
+            "schema_version": 2,
             "source_candidate_manifest": str(candidate_manifest),
+            "motion_set": args.motion_set,
             "requested_candidate_count": len(candidates),
             "motions": motions,
             "active_motion_ids": [
@@ -312,10 +358,12 @@ def main() -> None:
             category_probabilities[entry["category"]] * entry["sampling_weight_within_category"]
         )
 
+    global_center = _global_reference_center(valid, output_dir) if valid else None
     final_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "validated" if valid and not invalid else "partial" if valid else "failed",
         "source_candidate_manifest": str(candidate_manifest),
+        "motion_set": args.motion_set,
         "source_joint_config": str(source_config),
         "requested_candidate_count": len(candidates),
         "successful_motion_count": len(valid),
@@ -323,6 +371,7 @@ def main() -> None:
         "sampling_policy": "sample category from manifest probabilities, then clip from within-category weights",
         "category_sampling_probabilities": category_probabilities,
         "active_motion_ids": [entry["motion_id"] for entry in valid],
+        "global_reference_center": global_center,
         "motions": motions,
     }
     _write_manifest(manifest_path, final_manifest)
@@ -335,6 +384,8 @@ def main() -> None:
         print("Failures:")
         for entry in invalid:
             print(f"- {entry['motion_id']}: {entry['failure_reason']}")
+        if args.require_all_valid:
+            raise RuntimeError(f"{len(invalid)} of {len(candidates)} requested motions failed validation.")
 
 
 if __name__ == "__main__":

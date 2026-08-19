@@ -46,33 +46,34 @@ G1_AMP_KEY_BODY_NAMES = (
     "right_wrist_roll_rubber_hand",
 )
 
-# Per-joint median of ``dof_positions`` in the validated G1-23DoF AMP motion,
-# stored in ``G1_23DOF_POLICY_JOINT_NAMES`` order. This is a single static
-# residual-action center, not a phase-dependent motion-tracking target.
+# Per-joint median of ``dof_positions`` over every frame of all 30 strictly
+# validated G1-23DoF AMP clips, stored in ``G1_23DOF_POLICY_JOINT_NAMES``
+# order. This is one static residual-action center, never a time-varying
+# reference target.
 G1_23DOF_AMP_REFERENCE_CENTER = (
-    0.00006720926467096433,
-    0.0008278329623863101,
-    0.12541134655475616,
-    0.22213974595069885,
-    -0.20980997383594513,
-    -0.027748988941311836,
-    0.010647706687450409,
-    -0.02047574706375599,
-    -0.050090495496988297,
-    0.24736063182353973,
-    -0.0632830560207367,
-    0.18816867470741272,
-    -0.0642649307847023,
-    0.010063812136650085,
-    0.20127831399440765,
-    -0.017091942951083183,
-    1.1060980558395386,
-    0.01542535237967968,
-    -0.028484873473644257,
-    -0.17691969871520996,
-    0.036767031997442245,
-    1.1875739097595215,
-    0.2004910260438919,
+    -0.053957726806402206,
+    0.021534139290452003,
+    0.11950450390577316,
+    0.33395761251449585,
+    -0.29004335403442383,
+    0.0040415311232209206,
+    -0.10638310760259628,
+    -0.06431636214256287,
+    -0.07071777433156967,
+    0.3901515007019043,
+    -0.20892232656478882,
+    0.10049572587013245,
+    -0.05345692113041878,
+    0.003766000736504793,
+    0.25450289249420166,
+    -0.2478148639202118,
+    1.1357628107070923,
+    -0.010694418102502823,
+    0.027017267420887947,
+    -0.27165064215660095,
+    0.2043786346912384,
+    1.1201633214950562,
+    0.19554904103279114,
 )
 
 # Validated legged_lab G1-29DoF -> current G1-23DoF conversion. Keep this
@@ -83,7 +84,7 @@ G1_23DOF_AMP_MOTION_FILE = str(
 )
 G1_23DOF_AMP_MULTIMOTION_MANIFEST = str(
     Path(__file__).resolve().parents[8]
-    / "data/motions/g1_23dof_amp/multimotion/g1_23dof_amp_multimotion_manifest.json"
+    / "data/motions/g1_23dof_amp/all30/g1_23dof_amp_multimotion_manifest.json"
 )
 
 
@@ -107,8 +108,14 @@ class G1AmpEnvCfg(DirectRLEnvCfg):
     action_offset = G1_23DOF_AMP_REFERENCE_CENTER
     policy_joint_names = G1_23DOF_POLICY_JOINT_NAMES
 
-    # Minimal fixed forward command used by the 78-D policy observation and task reward.
+    # Fallback command for the single-clip compatibility path. With the all-30
+    # manifest, RSI replaces it by the selected reference state's body-frame
+    # [vx, vy, yaw_rate], while policy observation size remains 78.
     velocity_command = (0.5, 0.0, 0.0)
+    command_from_reference_state = True
+    linear_velocity_tracking_sigma = 0.25
+    yaw_rate_tracking_sigma = 0.25
+    yaw_rate_tracking_weight = 0.5
 
     # AMP body mapping, verified from the current G1 articulation.
     reference_body = "torso_link"
@@ -116,7 +123,8 @@ class G1AmpEnvCfg(DirectRLEnvCfg):
     key_body_names = G1_AMP_KEY_BODY_NAMES
 
     # The official 28-DoF Humanoid motion must never be used for this task.
-    # The validated manifest enables category-balanced multi-clip sampling.
+    # The validated all-30 manifest samples category -> independent clip ->
+    # valid time from update 0. No curriculum or concatenated trajectory is used.
     # Set motion_manifest=None to preserve the original single-file behavior.
     motion_manifest: str | None = G1_23DOF_AMP_MULTIMOTION_MANIFEST
     motion_file: str | None = G1_23DOF_AMP_MOTION_FILE
