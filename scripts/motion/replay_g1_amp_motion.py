@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
+import sys
 import time
+import traceback
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -242,7 +245,20 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        simulation_app.close()
+    if args_cli.fast_shutdown:
+        exit_code = 0
+        try:
+            main()
+        except BaseException:
+            traceback.print_exc()
+            exit_code = 1
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # Replay is a standalone validation subprocess; no simulator state is
+        # reused after all diagnostics and captures have been flushed.
+        os._exit(exit_code)
+    else:
+        try:
+            main()
+        finally:
+            simulation_app.close()

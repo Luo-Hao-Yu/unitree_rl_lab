@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
@@ -44,15 +46,50 @@ G1_AMP_KEY_BODY_NAMES = (
     "right_wrist_roll_rubber_hand",
 )
 
+# Per-joint median of ``dof_positions`` in the validated G1-23DoF AMP motion,
+# stored in ``G1_23DOF_POLICY_JOINT_NAMES`` order. This is a single static
+# residual-action center, not a phase-dependent motion-tracking target.
+G1_23DOF_AMP_REFERENCE_CENTER = (
+    0.00006720926467096433,
+    0.0008278329623863101,
+    0.12541134655475616,
+    0.22213974595069885,
+    -0.20980997383594513,
+    -0.027748988941311836,
+    0.010647706687450409,
+    -0.02047574706375599,
+    -0.050090495496988297,
+    0.24736063182353973,
+    -0.0632830560207367,
+    0.18816867470741272,
+    -0.0642649307847023,
+    0.010063812136650085,
+    0.20127831399440765,
+    -0.017091942951083183,
+    1.1060980558395386,
+    0.01542535237967968,
+    -0.028484873473644257,
+    -0.17691969871520996,
+    0.036767031997442245,
+    1.1875739097595215,
+    0.2004910260438919,
+)
+
+# Validated legged_lab G1-29DoF -> current G1-23DoF conversion. Keep this
+# explicit so AMP training cannot silently fall back to the official Humanoid
+# reference motion or to an unvalidated file.
+G1_23DOF_AMP_MOTION_FILE = str(
+    Path(__file__).resolve().parents[8] / "data/motions/g1_23dof_amp/walk_b13_turn_right_45.npz"
+)
+G1_23DOF_AMP_MULTIMOTION_MANIFEST = str(
+    Path(__file__).resolve().parents[8]
+    / "data/motions/g1_23dof_amp/multimotion/g1_23dof_amp_multimotion_manifest.json"
+)
+
 
 @configclass
 class G1AmpEnvCfg(DirectRLEnvCfg):
-    """Skeleton configuration for a G1-23DoF Direct AMP environment.
-
-    Reference-motion training is intentionally disabled until a motion file retargeted to the G1 skeleton is
-    available. The environment therefore defaults to a normal standing reset and can be instantiated and stepped
-    without pretending that the official 28-DoF Humanoid motion is compatible with G1.
-    """
+    """G1-23DoF Direct AMP environment using the validated G1 reference motion."""
 
     # environment
     episode_length_s = 20.0
@@ -65,8 +102,9 @@ class G1AmpEnvCfg(DirectRLEnvCfg):
     num_amp_observations = 2
     amp_observation_space = 71
 
-    # Keep the current PPO/deployment action semantics: q_target = q_default + 0.35 * action.
+    # Preserve 23-D residual position actions: q_target = q_reference_center + 0.35 * action.
     action_scale = 0.35
+    action_offset = G1_23DOF_AMP_REFERENCE_CENTER
     policy_joint_names = G1_23DOF_POLICY_JOINT_NAMES
 
     # Minimal fixed forward command used by the 78-D policy observation and task reward.
@@ -77,9 +115,14 @@ class G1AmpEnvCfg(DirectRLEnvCfg):
     motion_root_body = "pelvis"
     key_body_names = G1_AMP_KEY_BODY_NAMES
 
-    # Placeholder for a future G1-retargeted NPZ. The official Humanoid motion must not be used here.
-    motion_file: str | None = None
-    reset_strategy = "default"  # supported: default, random, random-start
+    # The official 28-DoF Humanoid motion must never be used for this task.
+    # The validated manifest enables category-balanced multi-clip sampling.
+    # Set motion_manifest=None to preserve the original single-file behavior.
+    motion_manifest: str | None = G1_23DOF_AMP_MULTIMOTION_MANIFEST
+    motion_file: str | None = G1_23DOF_AMP_MOTION_FILE
+    # Reference State Initialization (RSI): sample one valid walking state at
+    # reset only. This does not turn the residual controller into a tracker.
+    reset_strategy = "rsi"  # supported: default, rsi
 
     early_termination = True
     termination_height = 0.30

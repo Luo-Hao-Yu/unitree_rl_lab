@@ -10,7 +10,9 @@ import argparse
 import hashlib
 import importlib
 import os
+import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
@@ -381,7 +383,21 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        simulation_app.close()
+    if args_cli.fast_shutdown:
+        exit_code = 0
+        try:
+            main()
+        except BaseException:
+            traceback.print_exc()
+            exit_code = 1
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # Each conversion runs in an isolated subprocess. All output files are
+        # closed and atomically replaced before main() returns, so bypassing
+        # slow Kit teardown cannot leak state into the next conversion.
+        os._exit(exit_code)
+    else:
+        try:
+            main()
+        finally:
+            simulation_app.close()

@@ -1,7 +1,7 @@
 seed: 42
 
-# This mirrors Isaac Lab's official Humanoid AMP Walk configuration. Network and AMP optimization tuning are
-# intentionally deferred until a G1-retargeted reference motion is available.
+# Stage 1: task/safety reward from the environment plus AMP style reward.
+# No Max-plus and no manually designed arm-swing reward is active here.
 models:
   separate: True
   policy:
@@ -75,8 +75,8 @@ agent:
   value_loss_scale: 2.5
   discriminator_loss_scale: 5.0
   amp_batch_size: 512
-  task_reward_weight: 0.0
-  style_reward_weight: 1.0
+  task_reward_weight: 0.5
+  style_reward_weight: 0.5
   discriminator_batch_size: 4096
   discriminator_reward_scale: 2.0
   discriminator_logit_regularization_scale: 0.05
@@ -84,10 +84,10 @@ agent:
   discriminator_weight_decay_scale: 1.0e-04
   time_limit_bootstrap: False
   experiment:
-    directory: "unitree_g1_23dof_amp_walk"
+    directory: "unitree_g1_23dof_amp_only_stage1"
     experiment_name: ""
-    write_interval: auto
-    checkpoint_interval: auto
+    write_interval: 16
+    checkpoint_interval: 1600
 
 trainer:
   class: SequentialTrainer
