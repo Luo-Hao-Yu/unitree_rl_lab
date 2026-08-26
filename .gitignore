@@ -41,6 +41,7 @@ docker/.container.cfg
 **/wandb/*
 **/.neptune/*
 /logs_trash/
+/log_trash/
 docker/artifacts/
 *.tmp
 *.bak
